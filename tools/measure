@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Measure identical WAL/FULL workloads; no pass/fail timing thresholds."""
+import argparse
+import json
+import os
+import pathlib
+import platform
+import shlex
+import subprocess
+import sys
+import tempfile
+
+import mvbuild
+
+root = pathlib.Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--commits', type=int, default=200)
+parser.add_argument('--batch-rows', type=int, default=512)
+parser.add_argument('--repeat', type=int, default=1)
+parser.add_argument('--directory', help='parent directory for temporary databases on the target filesystem')
+parser.add_argument('--json', action='store_true', help='emit structured measurements')
+args = parser.parse_args()
+if not (1 <= args.commits <= 100_000 and 1 <= args.batch_rows <= 100_000 and 1 <= args.repeat <= 100):
+    parser.error('commits/batch-rows must be 1..100000 and repeat 1..100')
+host = root / 'target/sqlite'
+source = host / 'sqlite-amalgamation-3540000/sqlite3.c'
+if not source.exists():
+    subprocess.run([str(root / 'tools/build-host')], check=True)
+library = mvbuild.library(release=True)
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+obj = host / 'sqlite3-measure.o'
+flags = ['-O2', '-g', '-DSQLITE_THREADSAFE=1', '-DSQLITE_ENABLE_DBPAGE_VTAB',
+         '-Dfsync=mvfs_measure_fsync']
+# Keep this separate from production and fault-injection hosts.
+stamp = obj.with_suffix('.flags.json')
+command = cc + flags + ['-c', str(source), '-o', str(obj)]
+if (not obj.exists() or obj.stat().st_mtime < source.stat().st_mtime
+        or not stamp.exists() or stamp.read_text() != json.dumps(command)):
+    subprocess.run(command, check=True)
+    stamp.write_text(json.dumps(command))
+executable = mvbuild.host / 'measure'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O2', '-g', '-std=c11', '-I' + str(source.parent),
+                    str(root / 'tests/integration/measure.c'), str(obj)]
+               + libs + ['-o', str(executable)], check=True)
+results = []
+for repeat in range(1, args.repeat + 1):
+    with tempfile.TemporaryDirectory(prefix='monstervfs-measure-', dir=args.directory) as temporary:
+        for vfs in ['unix', mvbuild.VFS]:
+            output = subprocess.check_output([str(executable), library,
+                str(pathlib.Path(temporary) / vfs), vfs, str(args.commits), str(args.batch_rows)],
+                text=True, timeout=300)
+            records = [json.loads(line) for line in output.splitlines()]
+            results.append({'repeat': repeat, **records[0], 'stages': records[1:]})
+metadata = {
+    'platform': platform.platform(), 'library': library,
+    'commits': args.commits, 'autocommit_payload_bytes': 128,
+    'batch_rows': args.batch_rows, 'batch_payload_bytes': 4096,
+    'sqlite_page_bytes': 4096, 'protected_block_bytes': 4096,
+    'alignment_bytes': 4096,
+    'journal_mode': 'WAL', 'synchronous': 'FULL', 'fullfsync': 'ON',
+    'mmap_bytes': 0, 'cache_kib': 8192, 'automatic_checkpoint': False,
+    'counts': 'Actual host SQLite OS write and fsync/fdatasync calls; setup/close excluded. Direct Rust directory barriers are not instrumented.',
+}
+if args.json:
+    print(json.dumps({'configuration': metadata, 'results': results}, indent=2))
+else:
+    print(f"{metadata['platform']}; SQLite {results[0]['sqlite']}; {library}")
+    print(f"WAL/FULL, fullfsync=ON, page/block=4096, alignment=4096; {args.commits} x 128-byte autocommits + {args.batch_rows} x 4096-byte batch")
+    print('run  VFS                stage          ms    writes   write bytes   syncs   main bytes    WAL bytes   allocated')
+    for result in results:
+        for stage in result['stages']:
+            syncs = stage['sqlite_fsync_calls'] + stage['sqlite_fdatasync_calls']
+            print(f"{result['repeat']:>3}  {result['vfs']:<18} {stage['stage']:<11} {stage['elapsed_ms']:>8.3f} {stage['write_calls']:>8} {stage['write_bytes']:>13} {syncs:>7} {stage['main_bytes']:>12} {stage['wal_bytes']:>12} {stage['allocated_bytes']:>11}")
+    print('Capabilities: ' + ', '.join(f"{result['vfs']} PSOW={result['powersafe_overwrite']} sector={result['sector_bytes']}" for result in results[:2]))
+    print('Filesystem: ' + ', '.join(sorted({result.get('filesystem', result.get('filesystem_magic', '?')) for result in results})))
+    print(metadata['counts'])
+    print('Times describe this run only; files are removed afterward. Use --json for complete sizes and separate sync counters.')

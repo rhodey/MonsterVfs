@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+import pathlib, subprocess, sys, tempfile
+import mvbuild
+root = mvbuild.root
+library = mvbuild.library(release=True)
+subprocess.run([str(root/'tools/check-abi'), str(library)], check=True)
+with tempfile.TemporaryDirectory(prefix='monstervfs-smoke-') as directory:
+    subprocess.run([str(mvbuild.host/'abi-loadable'), str(library), str(pathlib.Path(directory)/'dynamic.db')], check=True)
+    static = mvbuild.host/'abi-static'
+    if static.exists():
+        subprocess.run([str(static), str(pathlib.Path(directory)/'static.db')], check=True)

@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Build both release libraries, or the format selected by MONSTERVFS_BUILD."""
+import os
+import mvbuild
+
+builds = [mvbuild.NAME] if 'MONSTERVFS_BUILD' in os.environ else ['parity', 'copy']
+for build in builds:
+    print(mvbuild.library(release=True, build=build))

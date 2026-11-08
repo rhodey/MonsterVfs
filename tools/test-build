@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Check host compatibility, extension dependencies and both build modes."""
+import os, pathlib, shlex, shutil, subprocess, tempfile
+import mvbuild
+root=pathlib.Path(__file__).resolve().parent.parent
+out=root/'target/build-tests'
+out.mkdir(parents=True,exist_ok=True)
+cc=shlex.split(os.environ.get('CC','cc'))
+subprocess.run(cc+['-std=c11','-Wall','-Wextra','-Werror','-I'+str(root/'vendor/sqlite'),'-I'+str(root/'c'),
+    str(root/'tests/build/api_capture.c'),str(root/'c/sqlite_api.c'),'-o',str(out/'api-capture')],check=True)
+subprocess.run([str(out/'api-capture')],check=True)
+subprocess.run([str(root/'tools/test-registration')],check=True)
+subprocess.run([str(root/'tools/smoke')],check=True)
+
+# A generic entry point must also work when the installation renames the library.
+with tempfile.TemporaryDirectory(prefix='monstervfs-renamed-') as directory:
+    renamed = pathlib.Path(directory) / ('renamed-extension.' + mvbuild.SUFFIX)
+    shutil.copy2(mvbuild.library(release=True), renamed)
+    subprocess.run([str(mvbuild.host / 'abi-loadable'), str(renamed),
+                    str(pathlib.Path(directory) / 'database')], check=True, timeout=30)

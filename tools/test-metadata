@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Metadata selection and ownership through real SQLite, with exact contents as an oracle."""
+import os, pathlib, shlex, shutil, struct, subprocess, sys, tempfile
+import mvbuild
+
+root = pathlib.Path(__file__).resolve().parent.parent
+host = root/'target/sqlite'
+if not (host/'sqlite3.o').exists():
+    subprocess.run([str(root/'tools/build-host')], check=True)
+library = mvbuild.library()
+binary = mvbuild.host/'metadata'
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+subprocess.run(cc + mvbuild.CFLAGS + ['-O1', '-g', '-I'+str(root/'vendor/sqlite'),
+    '-I'+str(root/'include'), str(root/'tests/integration/metadata.c'), str(host/'sqlite3.o')]
+    + libs + ['-o', str(binary)], check=True)
+
+def run(mode, database, count, *arguments):
+    subprocess.run([str(binary), library, mode, str(database), str(count), *map(str, arguments)],
+                   check=True, timeout=30)
+
+def contents(database):
+    return {suffix: pathlib.Path(str(database)+suffix).read_bytes() for suffix in ('', '-wal')}
+
+def unchanged(database, before):
+    assert contents(database) == before, f'{database}: read/refusal modified main or WAL'
+
+def duplicate(directory, source, name):
+    path = directory/name/'db'; path.parent.mkdir()
+    for suffix in ('', '-wal'):
+        shutil.copyfile(str(source)+suffix, str(path)+suffix)
+    return path
+
+def sector(path, offset, value):
+    before = path.read_bytes()
+    assert len(value) == 512
+    with path.open('r+b', buffering=0) as file:
+        file.seek(offset); assert file.write(value) == 512
+    after = path.read_bytes()
+    assert after[:offset] == before[:offset] and after[offset+512:] == before[offset+512:]
+    assert len(after) == len(before)
+
+with tempfile.TemporaryDirectory(prefix='monstervfs-metadata-') as temporary:
+    directory = pathlib.Path(temporary)
+    baselines = {}
+    for name, count, reuse in [('short', 2, 0), ('long', 4, 0), ('foreign', 4, 0), ('foreign-newer', 4, 2)]:
+        db = directory/name/'db'; db.parent.mkdir(); run('prepare', db, count, reuse); baselines[name] = db
+    for name, count in ([('short', 2), ('long', 4)] if mvbuild.NAME == 'copy' else []):
+        source = baselines[name]; original = contents(source)
+        old = pathlib.Path(str(source)+'-old-control').read_bytes()
+        # The real checkpoint/reuse history must establish the targeted versions.
+        assert [struct.unpack_from('<Q', original['-wal'], at+8)[0]
+                for at in (8192, 10240, 12288, 14336)] == [2, 2, 3, 3]
+        assert struct.unpack_from('<Q', old, 12288+8)[0] == 1
+        for half in (0, 2048):
+            db = duplicate(directory, source, f'{name}-stale-{half}')
+            wal = pathlib.Path(str(db)+'-wal'); offset = 12288+half
+            sector(wal, offset, old[offset:offset+512])
+            before = contents(db)
+            assert before[''] == original[''] and before['-wal'][16384:] == original['-wal'][16384:]
+            run('read', db, count); unchanged(db, before)
+            run('continue', db, count); run('read', db, count+1)
+            print(f'{name}, stale control half {half}: all committed rows survive and writes continue', flush=True)
+
+    source = baselines['long']; foreign = contents(baselines['foreign'])
+    for offset in ((0, 2048, 4096, 6144) if mvbuild.NAME == 'copy' else []):
+        db = duplicate(directory, source, f'prefix-{offset}')
+        sector(db, offset, foreign[''][offset:offset+512])
+        before = contents(db); assert before[''][8192:] == source.read_bytes()[8192:]
+        run('read', db, 4); unchanged(db, before)
+        run('repair-prefix', db, 4, source)
+        assert db.read_bytes() == source.read_bytes(), 'prefix repair changed main contents'
+        run('read', db, 4)
+        print(f'foreign immutable half {offset}: reads preserved and prefix repaired', flush=True)
+
+    # A full offline copy preserves the file ID and remains writable at a new path.
+    db = duplicate(directory, source, 'offline-copy')
+    before = contents(db); run('read', db, 4); unchanged(db, before)
+    run('continue', db, 4); run('read', db, 5)
+
+    # Donor sectors are genuine writes, including their checksums/parity. No test
+    # recalculates protection or calls the production selection implementation.
+    current = contents(source)['-wal']
+    older = pathlib.Path(str(baselines['foreign'])+'-old-control').read_bytes()
+    newer = contents(baselines['foreign-newer'])['-wal']
+    assert current[16:32] != foreign['-wal'][16:32] != newer[16:32]
+    positions = (8192, 10240, 12288, 14336) if mvbuild.NAME == 'copy' else (8192, 12288)
+    current_sequence = max(struct.unpack_from('<Q', current, at+8)[0] for at in positions)
+    assert current_sequence == 3
+    donors = [('older', older, 12288), ('equal', foreign['-wal'], 12288),
+              ('newer', newer, max(positions, key=lambda at: struct.unpack_from('<Q', newer, at+8)[0]))]
+    for relation, donor, at in donors:
+        sequence = struct.unpack_from('<Q', donor, at+8)[0]
+        assert {'older': sequence < current_sequence, 'equal': sequence == current_sequence,
+                'newer': sequence > current_sequence}[relation]
+        assert donor[at+60:at+76] == donor[16:32], 'control must store its protected file identity'
+        assert donor[16:32] != current[16:32]
+        for mode in ('refuse-ro', 'refuse-rw', 'refuse-exclusive'):
+            for destination in positions:
+                db = duplicate(directory, source, f'foreign-{relation}-{mode}-{destination}')
+                sector(pathlib.Path(str(db)+'-wal'), destination, donor[at:at+512])
+                before = contents(db); run(mode, db, 4); unchanged(db, before)
+        print(f'foreign {relation} controls refuse at every position without changing main or WAL', flush=True)
+
+    # A completed checkpoint leaves no frames, but its surviving controls must
+    # still belong here. No uncheckpointed data is discarded to build this case.
+    empty = directory/'empty'/'db'; empty.parent.mkdir(); run('prepare-empty', empty, 4)
+    assert len(contents(empty)['-wal']) == 16384
+    db = duplicate(directory, empty, 'empty-offline-copy')
+    before = contents(db); run('read', db, 4); unchanged(db, before)
+    run('continue', db, 4); run('read', db, 5)
+    _, donor, at = donors[-1]
+    for mode in ('refuse-ro', 'refuse-rw', 'refuse-exclusive'):
+        for destination in positions:
+            db = duplicate(directory, empty, f'empty-foreign-{mode}-{destination}')
+            sector(pathlib.Path(str(db)+'-wal'), destination, donor[at:at+512])
+            before = contents(db); run(mode, db, 4); unchanged(db, before)
+    print('Frame-free WAL foreign controls refuse without changing main or WAL', flush=True)
+
+    for mode in ('refuse-ro', 'refuse-rw', 'refuse-exclusive'):
+        db = duplicate(directory, source, f'prefix-conflict-{mode}')
+        offsets = (0, 4096) if mvbuild.NAME == 'copy' else (0,)
+        for offset in offsets: sector(db, offset, foreign[''][offset:offset+512])
+        before = contents(db); run(mode, db, 4); unchanged(db, before)
+    print('Ambiguous metadata refuses without changing main or WAL through close.', flush=True)
+print(f'{mvbuild.NAME} metadata regressions passed.')

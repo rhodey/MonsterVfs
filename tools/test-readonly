@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Read-only connections: identical to native SQLite, plus damage native cannot show."""
+import os, pathlib, shlex, subprocess, sys, tempfile
+import mvbuild
+root = pathlib.Path(__file__).resolve().parent.parent
+host = root/'target/sqlite'
+if not (host/'sqlite3.o').exists():
+    subprocess.run([str(root/'tools/build-host')], check=True)
+library = mvbuild.library()
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+binary = mvbuild.host/'readonly'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O1', '-g', '-w', '-I'+str(root/'vendor/sqlite'), '-I'+str(root/'include'),
+    str(root/'tests/integration/readonly.c'), str(host/'sqlite3.o')] + libs + ['-o', str(binary)], check=True)
+# The only intended differences from native.
+EXPECTED = {
+    'nolock': 'open=E14',  # Native fails the same way, at the first read.
+    'mmap_size': 'E1',     # A mapped read would bypass verification.
+    # A retained early main reader must reopen after initialization. SQLite can
+    # report its cached empty schema as ERROR without another VFS read callback.
+    'empty, then filled while open': '0 then E1',
+}
+if os.geteuid() == 0:
+    sys.exit('run as a normal user: root ignores the permissions these scenarios set')
+def table(directory, vfs, *arguments):
+    output = subprocess.check_output([str(binary), 'table', vfs, directory, *arguments], text=True, timeout=300)
+    return dict(line.split('\t', 1) for line in output.splitlines())
+with tempfile.TemporaryDirectory(prefix='monstervfs-readonly-') as directory:
+    native = table(directory, 'unix')
+    ours = table(directory, mvbuild.VFS, library)
+    differ = [k for k in native if ours.get(k) != EXPECTED.get(k, native[k])]
+    for key in differ:
+        print(f'{key}: native {native[key]}, {mvbuild.VFS} {ours.get(key)}')
+    if differ:
+        sys.exit(f'{len(differ)} of {len(native)} read-only outcomes differ from native')
+    print(f'{len(native)} read-only outcomes match native, apart from {len(EXPECTED)} intended differences')
+    subprocess.run([str(binary), 'damage', directory, library], check=True, timeout=300)

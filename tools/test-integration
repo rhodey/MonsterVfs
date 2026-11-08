@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Independent host tests against the loadable artifact, including real processes."""
+import os, pathlib, subprocess, sys, tempfile
+import mvbuild
+root=pathlib.Path(__file__).resolve().parent.parent
+host=root/'target/sqlite'
+source=host/'sqlite-amalgamation-3540000'
+extension=mvbuild.library()
+binary=mvbuild.host/'vfs-integration'
+subprocess.run([os.environ.get('CC','cc'),*mvbuild.CFLAGS,'-O2','-g','-I'+str(source),str(root/'tests/integration/vfs.c'),str(host/'sqlite3.o'),'-lpthread','-lm']+([] if sys.platform=='darwin' else ['-ldl'])+['-o',str(binary)],check=True)
+vacuum=mvbuild.host/'vacuum'
+subprocess.run([os.environ.get('CC','cc'),*mvbuild.CFLAGS,'-O2','-g','-I'+str(source),
+    str(root/'tests/integration/vacuum.c'),str(host/'sqlite3.o'),'-lpthread','-lm']
+    +([] if sys.platform=='darwin' else ['-ldl'])+['-o',str(vacuum)],check=True)
+temporary = {}
+for name in ('temp_sorter', 'temp_subjournal'):
+    program = mvbuild.host/name
+    subprocess.run([os.environ.get('CC','cc'),*mvbuild.CFLAGS,'-O2','-g','-I'+str(source),
+        str(root/'tests/integration'/f'{name}.c'),str(host/'sqlite3.o'),'-lpthread','-lm']
+        +([] if sys.platform=='darwin' else ['-ldl'])+['-o',str(program)],check=True)
+    temporary[name] = program
+with tempfile.TemporaryDirectory(prefix='monstervfs-integration-') as tmp:
+    for vfs in ('unix',mvbuild.VFS):
+        subprocess.run([str(vacuum),str(extension),str(pathlib.Path(tmp)/('vacuum-'+vfs)),vfs],
+                       check=True,timeout=120)
+        for name, program in temporary.items():
+            tempdir = pathlib.Path(tmp)/(name+'-'+vfs+'-files')
+            tempdir.mkdir()
+            subprocess.run([str(program),str(extension),
+                str(pathlib.Path(tmp)/(name+'-'+vfs+'.db')),vfs,str(tempdir)],
+                check=True,timeout=120)
+    def run(database,mode):subprocess.run([str(binary),str(extension),str(pathlib.Path(tmp)/database),mode],check=True,timeout=45)
+    run('sql.db','sql')
+    # Parity remains configurable with the same 4 KiB pages and 8 KiB slots.
+    if mvbuild.NAME == 'parity':
+        for parity in (32, 1024):
+            uri=f'file:{pathlib.Path(tmp)/str(parity)}?mv_parity={parity}'
+            subprocess.run([str(binary),str(extension),uri,'configured'],check=True,timeout=45)
+    run('recovery.db','crash_prepare')
+    run('recovery.db','recover')
+    run('damaged.db','crash_prepare')
+    wal=pathlib.Path(tmp)/'damaged.db-wal'
+    with wal.open('r+b',buffering=0) as f:
+        # Each copy alone is a whole frame, so a cut in `copy` needs both damaged.
+        for sector in (4096,0) if mvbuild.NAME=='copy' else (4096,):
+            f.seek(16384+10*8192+sector+200)
+            original=f.read(64)
+            assert len(original)==64
+            f.seek(-64,1);f.write(bytes(b^0x5a for b in original))
+        os.fsync(f.fileno())
+    run('damaged.db','recover')
+    run('concurrent.db','concurrent_prepare')
+    commands=[[str(binary),str(extension),str(pathlib.Path(tmp)/'concurrent.db'),mode] for mode in ['writer','writer','reader']]
+    processes=[subprocess.Popen(command) for command in commands]
+    try:
+        for process in processes:
+            assert process.wait(timeout=60)==0
+    finally:
+        for process in processes:
+            if process.poll() is None:process.kill()
+        for process in processes:process.wait()
+    run('concurrent.db','concurrent_check')
+print('SQLite SQL, disk temporary files/savepoints, initialization/VACUUM, crash recovery, corruption cutoff, and multiprocess integration passed.')

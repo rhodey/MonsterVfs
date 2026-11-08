@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Run the explicit public SQLite regression subset without changing its tests.
+
+--broad also runs every other script that matched the native VFS when last surveyed, in
+parallel. These run leniently, like the manifest's own lenient list."""
+import argparse, concurrent.futures, json, os, pathlib, re, resource, subprocess, tempfile
+import mvbuild
+root=pathlib.Path(__file__).resolve().parent.parent
+# Each protected file holds more descriptors than native, and scripts open hundreds.
+soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE,(hard if hard!=resource.RLIM_INFINITY else max(soft,65536),hard))
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--broad',action='store_true',help='also run the manifest\'s broad list')
+parser.add_argument('--only-broad',action='store_true',help='run only the broad list')
+parser.add_argument('--timeout',type=int,default=900,help='seconds per broad script')
+arguments=parser.parse_args()
+manifest=json.loads((root/'tests/sqlite/applicability.json').read_text())
+fixture=root/'target/testfixture'/mvbuild.NAME/'testfixture'
+source=root/'target/testfixture/sqlite-src-3540000/test'
+def run(name, lenient, limit=None):
+    with tempfile.TemporaryDirectory(prefix='monstervfs-sqlite-') as temporary:
+        directory=pathlib.Path(temporary)
+        script=directory/'run.tcl'
+        # tester.tcl's existing permutation hooks configure every connection.
+        script.write_text('set ::G(perm:name) wal\n'
+            'set ::G(perm:sqlite3_args) {-vfs '+mvbuild.VFS+'}\n'
+            'set ::G(perm:presql) {PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;}\n'
+            'set argv0 {'+str(source/name)+'}\nset argv {}\nsource $argv0\n')
+        environment={**os.environ, **({'MONSTERVFS_LENIENT': '1'} if lenient else {})}
+        try:
+            result=subprocess.run([str(fixture),str(script)],cwd=directory,text=True,errors='replace',stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=environment,timeout=limit)
+        except subprocess.TimeoutExpired:
+            return name,None,'timeout'
+        summary=re.search(r'(\d+) errors out of (\d+) tests',result.stdout)
+        if result.returncode or not summary or int(summary[1]):
+            return name,None,result.stdout
+        return name,int(summary[2]),''
+total=0
+if not arguments.only_broad:
+    for name, lenient in [(name, False) for name in manifest['tests']] + [(name, True) for name in manifest['lenient']]:
+        name,count,output=run(name,lenient)
+        if count is None:
+            print(output)
+            raise SystemExit(f'{name} failed')
+        total+=count
+        print(f'{name}: {count} tests passed'+(' (lenient)' if lenient else ''),flush=True)
+    print(f'{total} selected public SQLite tests passed under '+manifest['configuration']+f', on {mvbuild.VFS}')
+if arguments.broad or arguments.only_broad:
+    failed,broad=[],0
+    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+        for name,count,output in pool.map(lambda n: run(n,True,arguments.timeout),manifest['broad']):
+            if count is None:
+                failed.append(name)
+                print(f'{name} FAILED\n{output[-1200:]}',flush=True)
+            else:
+                broad+=count
+    if failed: raise SystemExit(f'{len(failed)} broad scripts failed: '+' '.join(failed))
+    print(f"{broad} more tests passed in {len(manifest['broad'])} broad scripts")

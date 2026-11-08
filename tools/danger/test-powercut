@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Cut power under a real filesystem, let its journal recover, and reopen. Linux, as root.
+
+A workload commits on a dm-flakey device and records each acknowledgement elsewhere. At a
+random moment the device stops taking writes, even in the middle of a sync. The filesystem
+is then remounted, and a fresh process checks what survived, read-only first. The native
+VFS runs on the same mount as a control, and a run with synchronous=OFF must lose commits
+first, or this test proves nothing. data=journal hangs the kernel on write errors, so
+that mode uses dropped writes alone."""
+import argparse, collections, json, os, pathlib, random, shlex, shutil, signal, subprocess, sys, tempfile, time
+root = pathlib.Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(root/'tools'))
+import mvbuild
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--fs', default='ext4', help='ext4, xfs or btrfs')
+parser.add_argument('--options', default='', help='mount options, such as data=writeback')
+parser.add_argument('--seconds', type=int, default=120)
+parser.add_argument('--seed', type=int, default=1)
+parser.add_argument('--vfs', default=f'{mvbuild.VFS},unix')
+parser.add_argument('--library', help='extension to test; defaults to the release build')
+parser.add_argument('--keep', default='/var/tmp/monstervfs-powercut-failures', help='where failed databases go')
+parser.add_argument('--skip-sanity', action='store_true')
+parser.add_argument('--may-hang-this-host', action='store_true', help='required: see tools/danger/README.md')
+args = parser.parse_args()
+if not args.may_hang_this_host:
+    sys.exit('This can hang the kernel until a reboot. Read tools/danger/README.md, then pass --may-hang-this-host.')
+if sys.platform != 'linux' or os.geteuid() != 0:
+    sys.exit('run as root on Linux: this drives device-mapper')
+def sh(*command, check=True):
+    return subprocess.run(command, check=check, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+owner = os.environ.get('SUDO_USER')
+def built():
+    library = args.library or str(mvbuild.released())
+    if not pathlib.Path(library).exists() or not (root/'target/sqlite/sqlite3.o').exists():
+        sys.exit('build first: tools/build-host, then tools/smoke')
+    binary = mvbuild.host/'powercut'
+    cc = shlex.split(os.environ.get('CC', 'cc'))
+    subprocess.run(cc + mvbuild.CFLAGS + ['-O1', '-g', '-w', '-I'+str(root/'vendor/sqlite'), str(root/'tests/danger/powercut.c'),
+        str(root/'target/sqlite/sqlite3.o'), '-lpthread', '-lm', '-ldl', '-o', str(binary)], check=True)
+    return library, str(binary)
+library, binary = built()
+sh('modprobe', 'dm_flakey')
+name, mount = 'monstervfs-powercut', '/mnt/monstervfs-powercut'
+device = '/dev/mapper/' + name
+def table(sectors, loop, features):
+    return f'0 {sectors} flakey {loop} 0 180 0' if features is None else f'0 {sectors} flakey {loop} 0 0 180 1 {features}'
+def reload(text):
+    sh('dmsetup', 'suspend', '--nolockfs', name); sh('dmsetup', 'load', name, '--table', text); sh('dmsetup', 'resume', name)
+def unmount():
+    for _ in range(100):
+        if sh('umount', mount, check=False).returncode == 0: return
+        time.sleep(.05)
+    sys.exit('cannot unmount ' + mount)
+def campaign(vfses, seconds, options, environment):
+    def mounted(): sh('mount', '-t', args.fs, *(('-o', options) if options else ()), device, mount)
+    state = tempfile.mkdtemp(prefix='monstervfs-powercut-', dir='/var/tmp')
+    image = state + '/device.img'
+    sh('truncate', '-s', '1G', image)
+    loop = sh('losetup', '-f', '--show', image).stdout.strip()
+    sectors = sh('blockdev', '--getsz', loop).stdout.strip()
+    sh('dmsetup', 'create', name, '--table', table(sectors, loop, None))
+    sh(*(('mkfs.ext4', '-q', '-F') if args.fs == 'ext4' else ('mkfs.' + args.fs, '-q', '-f')), device)
+    os.makedirs(mount, exist_ok=True); mounted()
+    rng = random.Random(args.seed)
+    stats = {vfs: collections.Counter() for vfs in vfses}
+    failures = collections.Counter(); first = {}
+    styles = ('drop_writes',) if 'data=journal' in options else ('error_writes', 'drop_writes')
+    turn = 0; end = time.time() + seconds
+    while time.time() < end:
+        vfs = vfses[turn % len(vfses)]; turn += 1
+        directory = f'{mount}/{vfs}'; os.makedirs(directory, exist_ok=True)
+        db, ack = directory + '/db', f'{state}/ack-{vfs}'
+        def remove():
+            for suffix in ('', '-wal', '-shm'):
+                if os.path.exists(db + suffix): os.unlink(db + suffix)
+            if os.path.exists(ack): os.unlink(ack)
+        if not stats[vfs]['cuts'] % 6: remove()    # So that creation gets its share of cuts.
+        procs = [subprocess.Popen([binary, mode, library, vfs, db, ack, str(rng.randrange(1 << 30))],
+                                  stderr=subprocess.DEVNULL, env={**os.environ, **environment}) for mode in ('write', 'read')]
+        time.sleep(rng.uniform(.01, 1.0))
+        style = rng.choice(styles)
+        # A process stopped first cannot record an acknowledgement for a dropped sync.
+        if style == 'drop_writes':
+            for p in procs: p.send_signal(signal.SIGSTOP)
+        reload(table(sectors, loop, style))
+        if style == 'error_writes': time.sleep(.02)
+        for p in procs: p.kill()
+        for p in procs: p.wait()
+        stats[vfs]['cuts'] += 1
+        unmount(); reload(table(sectors, loop, None)); mounted()
+        try:
+            result = subprocess.run([binary, 'check', library, vfs, db, ack, '0'], capture_output=True, text=True, timeout=120)
+            line = result.stdout.strip() or f'CRASH exit={result.returncode} {result.stderr[:100]}'
+        except subprocess.TimeoutExpired:
+            line = 'FAIL timeout'
+        if line.startswith('OK'):
+            stats[vfs]['ok'] += 1
+            stats[vfs]['mid-commit'] += any(w.startswith('ahead=') and w != 'ahead=0' for w in line.split())
+        else:
+            stats[vfs]['failed'] += 1
+            kind = vfs + ': ' + ' '.join(line.split()[:3]); failures[kind] += 1
+            if kind not in first:
+                first[kind] = line
+                target = f'{args.keep}/{turn}-{vfs}'; os.makedirs(target, exist_ok=True)
+                for suffix in ('', '-wal', '-shm'):
+                    if os.path.exists(db + suffix): shutil.copy(db + suffix, target + '/db' + suffix)
+            remove()
+    unmount()
+    fsck = sh('e2fsck', '-fn', device, check=False).stdout.strip().splitlines()[-1] if args.fs == 'ext4' else ''
+    sh('dmsetup', 'remove', name); sh('losetup', '-d', loop); shutil.rmtree(state)
+    return {vfs: dict(counts) for vfs, counts in stats.items()}, dict(failures), first, fsck
+sh('umount', mount, check=False); sh('dmsetup', 'remove', name, check=False)
+if not args.skip_sanity:
+    stats, failures, first, _ = campaign(['unix'], 20, args.options, {'POWERCUT_NOSYNC': '1'})
+    if not failures: sys.exit(f'sanity: synchronous=OFF lost nothing, so these cuts prove nothing: {stats}')
+    print(f"sanity: synchronous=OFF failed {stats['unix'].get('failed', 0)} of {stats['unix']['cuts']} cuts, as it must", flush=True)
+stats, failures, first, fsck = campaign(args.vfs.split(','), args.seconds, args.options, {})
+print(json.dumps({'fs': args.fs, 'options': args.options, 'stats': stats, 'failures': failures, 'first': first, 'fsck': fsck}, indent=1))
+sys.exit(1 if failures else 0)

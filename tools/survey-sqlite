@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Run upstream SQLite scripts outside the manifest, to find candidates for it.
+
+Forcing WAL onto scripts written for other modes makes many fail for reasons unrelated
+to the VFS, so read the results as leads, not verdicts. Each failing log is kept. The
+fixture's default VFS is MonsterVfs, so '--vfs unix' controls only the parent process."""
+import argparse, concurrent.futures, json, os, pathlib, re, subprocess, tempfile
+import mvbuild
+root = pathlib.Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('scripts', nargs='*', help='script names; defaults to the wal* and crash* scripts')
+parser.add_argument('--vfs', default=mvbuild.VFS)
+parser.add_argument('--timeout', type=int, default=180)
+parser.add_argument('--lenient', action='store_true', help='absorb the settings MonsterVfs rejects, in a fixture built by build-testfixture')
+parser.add_argument('--logs', default=str(root/'target/testfixture/survey'))
+args = parser.parse_args()
+fixture = root/'target/testfixture'/mvbuild.NAME/'testfixture'
+source = root/'target/testfixture/sqlite-src-3540000/test'
+logs = pathlib.Path(args.logs)
+logs.mkdir(parents=True, exist_ok=True)
+scripts = args.scripts or sorted(p.name for p in [*source.glob('wal*.test'), *source.glob('crash*.test')])
+listed = json.loads((root/'tests/sqlite/applicability.json').read_text())
+manifest = set(listed['tests'] + listed['lenient'])
+environment = {**os.environ, **({'MONSTERVFS_LENIENT': '1'} if args.lenient else {})}
+
+def survey(name):
+    with tempfile.TemporaryDirectory(prefix='monstervfs-survey-') as temporary:
+        directory = pathlib.Path(temporary)
+        (directory/'run.tcl').write_text('set ::G(perm:name) wal\n'
+            'set ::G(perm:sqlite3_args) {-vfs '+args.vfs+'}\n'
+            'set ::G(perm:presql) {PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;}\n'
+            'set argv0 {'+str(source/name)+'}\nset argv {}\nsource $argv0\n')
+        try:
+            result = subprocess.run([str(fixture), 'run.tcl'], cwd=directory, text=True, errors='replace',
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=args.timeout, env=environment)
+        except subprocess.TimeoutExpired:
+            return name, 'timeout'
+    (logs/f'{name}.log').write_text(result.stdout)
+    summary = re.search(r'(\d+) errors out of (\d+) tests', result.stdout)
+    if summary: return name, summary[0]
+    return name, f'aborted (exit {result.returncode})'
+
+with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+    for name, outcome in pool.map(survey, scripts):
+        print(f'{name:28s} {outcome}{"  [manifest]" if name in manifest else ""}', flush=True)

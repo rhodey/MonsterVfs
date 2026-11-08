@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Damage and resource scenarios through real SQLite, composed from separate processes."""
+import os, pathlib, shlex, subprocess, sys, tempfile, time
+import mvbuild
+root = pathlib.Path(__file__).resolve().parent.parent
+host = root/'target/sqlite'
+if not (host/'sqlite3.o').exists():
+    subprocess.run([str(root/'tools/build-host')], check=True)
+library = mvbuild.library()
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+binary = mvbuild.host/'damage'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O1', '-g', '-I'+str(root/'vendor/sqlite'), '-I'+str(root/'include'),
+    str(root/'tests/integration/damage.c'), str(host/'sqlite3.o')] + libs + ['-o', str(binary)], check=True)
+EXPECTED = {
+    'clean': 'consistent',          # No damage: everything survives.
+    'rot': 'cut',                   # Nothing reached main, so the cutoff stays consistent.
+    'zero': 'cut',                  # A zero slot is the same loss as damage.
+    'rot-checkpoint': 'refuse',     # Main may be ahead of any retained prefix.
+    'checkpoint-rot': 'refuse',
+    'checkpoint-zero': 'refuse',
+    'no-control': 'refuse',         # Frames with no header: the watermark is unknown.
+}
+def command(mode, database, *arguments):
+    return [str(binary), library, mode, str(database), *map(str, arguments)]
+def run(mode, database, *arguments):
+    subprocess.run(command(mode, database, *arguments), check=True, timeout=120)
+with tempfile.TemporaryDirectory(prefix='monstervfs-damage-') as temporary:
+    directory = pathlib.Path(temporary)
+    for variant, expected in EXPECTED.items():
+        database = directory/f'bank-{variant}'
+        run('bank', database, variant)
+        run('bank-check', database, expected)
+    for mode in ['dead-slot', 'erased-page', 'descriptors', 'scrub', 'reserved-bytes', 'lost-metadata-page',
+                 'lost-sector-write', 'settings', 'trim-dead-frames'] + (['lost-copy'] if mvbuild.NAME == 'copy' else []):
+        run(mode, directory/mode)
+    run('refusal-prepare', directory/'refusal')
+    run('refusal-close', directory/'refusal')
+    run('lost-metadata-frame-prepare', directory/'frame')
+    run('lost-metadata-frame', directory/'frame')
+    run('disk-full', directory/'full')
+    run('disk-full-reopen', directory/'full')
+
+    shm = directory/'shm'
+    writer = subprocess.Popen(command('shm-writer', shm))
+    run('shm-client', shm)
+    assert writer.wait(timeout=30) == 0
+
+    for mode in ['watermark-cut', 'watermark-reused', 'watermark-rollback', 'watermark-rebuilt',
+                 'watermark-rebuilt-next', 'watermark-dead-next', 'watermark-dead-past',
+                 'watermark-dead-open', 'watermark-write', 'watermark-write-restart',
+                 'watermark-refuses']:
+        run(mode, directory/mode)
+
+    run('cutoff-prepare', directory/'exclusive')
+    run('cutoff-exclusive', directory/'exclusive')
+
+    run('cutoff-prepare', directory/'openers')
+    start = time.clock_gettime(time.CLOCK_MONOTONIC) + 0.5
+    openers = [subprocess.Popen(command('cutoff-open', directory/'openers', start, 1)) for _ in range(4)]
+    try:
+        for opener in openers:
+            assert opener.wait(timeout=30) == 0, 'an opener failed during a contended cutoff'
+    finally:
+        for opener in openers:
+            if opener.poll() is None: opener.kill()
+
+    reader = subprocess.Popen(command('cutoff-reader', directory/'held'), stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True)
+    assert reader.stdout.readline().strip() == 'ready'
+    with open(f'{directory}/held-shm', 'r+b', buffering=0) as index:
+        index.write(bytes(96))  # The next reader must recover while this one is live.
+    run('cutoff-blocked', directory/'held')
+    reader.stdin.write('\n')
+    reader.stdin.close()
+    assert reader.wait(timeout=30) == 0
+    run('cutoff-released', directory/'held')
+print('Damage scenarios passed: atomicity, cutoff reporting, dead slots, lost sectors, reserved bytes, full disks, scrubbing and contention.')

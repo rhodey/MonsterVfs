@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""A database that crosses SQLite's lock page, on the native VFS and on MonsterVfs.
+
+SQLite never uses the page holding its lock bytes, which leaves a hole. A quick run moves
+the lock page down with SQLite's test control. --real builds past the true page at 1 GiB
+and past 4 GiB of physical file, which takes minutes and about 5 GiB of disk."""
+import argparse, os, pathlib, shlex, subprocess, sys, tempfile
+import mvbuild
+root = pathlib.Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--real', action='store_true', help='cross the true lock page, and 4 GiB of physical file')
+parser.add_argument('--directory', help='keep files here instead of a temporary directory')
+parser.add_argument('--library', help='extension to test; defaults to the debug build')
+arguments = parser.parse_args()
+host = root/'target/sqlite'
+if not (host/'sqlite3.o').exists():
+    subprocess.run([str(root/'tools/build-host')], check=True)
+library = mvbuild.library(arguments.library)
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+binary = mvbuild.host/'large'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O1', '-g', '-I'+str(root/'vendor/sqlite'), str(root/'tests/integration/large.c'),
+    str(host/'sqlite3.o')] + libs + ['-o', str(binary)], check=True)
+lock_byte, pages = (0x40000000, 560000) if arguments.real else (0x100000, 1024)
+def run(directory):
+    outcomes = {}
+    for vfs in ('unix', mvbuild.VFS):
+        result = subprocess.run([str(binary), library, vfs, str(pathlib.Path(directory)/vfs), str(lock_byte), str(pages)],
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=7200)
+        print(f'--- {vfs}\n{result.stdout}', end='', flush=True)
+        if result.returncode: raise SystemExit(f'{vfs} failed')
+        outcomes[vfs] = [line for line in result.stdout.splitlines() if line.startswith('lock page')]
+    if outcomes['unix'] != outcomes[mvbuild.VFS]: raise SystemExit('the lock page reads differently from native')
+if arguments.directory:
+    run(arguments.directory)
+else:
+    with tempfile.TemporaryDirectory(prefix='monstervfs-large-') as temporary:
+        run(temporary)
+print('Large database passed: the lock page, repair above it, and VACUUM across it match native.')

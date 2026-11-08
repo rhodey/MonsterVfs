@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Exercise persistent maintenance through an independently built SQLite host."""
+import os
+import pathlib
+import shlex
+import subprocess
+import sys
+import tempfile
+
+import mvbuild
+
+root = pathlib.Path(__file__).resolve().parent.parent
+host = mvbuild.host
+if not (root / 'target/sqlite/sqlite3.o').exists():
+    subprocess.run([str(root / 'tools/build-host')], check=True)
+library = mvbuild.library()
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+executable = host / 'maintenance'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O2', '-g', '-I' + str(root / 'vendor/sqlite'),
+    str(root / 'tests/integration/maintenance.c'), str(root / 'target/sqlite/sqlite3.o')]
+    + libs + ['-o', str(executable)], check=True)
+with tempfile.TemporaryDirectory(prefix='monstervfs-maintenance-') as temporary:
+    subprocess.run([str(executable), library, str(pathlib.Path(temporary) / 'database')], check=True, timeout=60)

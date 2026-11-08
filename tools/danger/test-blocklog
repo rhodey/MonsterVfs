@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Rebuild the disk at each crash point of a database's life. Linux, as root.
+
+dm-log-writes records every block write a real filesystem sends to its device, in order.
+This replays that log and, at each flush and a sample of other points, mounts the disk as
+it stood there and checks the database. Since a drive's cache may finish any subset of
+what has not been flushed, each point before a flush is also tried with a random subset."""
+import argparse, collections, json, mmap, os, pathlib, random, shlex, shutil, struct, subprocess, sys, tempfile, time
+root = pathlib.Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(root/'tools'))
+import mvbuild
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--fs', default='ext4', help='ext4, xfs or btrfs')
+parser.add_argument('--options', default='', help='mount options, such as data=writeback')
+parser.add_argument('--vfs', default=mvbuild.VFS)
+parser.add_argument('--library', help='extension to test; defaults to the release build')
+parser.add_argument('--points', type=int, default=900)
+parser.add_argument('--seed', type=int, default=1)
+parser.add_argument('--may-hang-this-host', action='store_true', help='required: see tools/danger/README.md')
+args = parser.parse_args()
+if not args.may_hang_this_host:
+    sys.exit('This can hang the kernel until a reboot. Read tools/danger/README.md, then pass --may-hang-this-host.')
+if sys.platform != 'linux' or os.geteuid() != 0:
+    sys.exit('run as root on Linux: this drives device-mapper')
+library = args.library or str(mvbuild.released())
+if not pathlib.Path(library).exists() or not (root/'target/sqlite/sqlite3.o').exists():
+    sys.exit('build first: tools/build-host, then tools/smoke')
+binary = str(mvbuild.host/'powercut')
+subprocess.run(shlex.split(os.environ.get('CC', 'cc')) + mvbuild.CFLAGS + ['-O1', '-g', '-w', '-I'+str(root/'vendor/sqlite'), str(root/'tests/danger/powercut.c'),
+    str(root/'target/sqlite/sqlite3.o'), '-lpthread', '-lm', '-ldl', '-o', binary], check=True)
+state = tempfile.mkdtemp(prefix='monstervfs-blocklog-', dir='/var/tmp')
+SIZE = 96 << 20
+data, log, shot, ack = state + '/data.img', state + '/log.img', '/dev/shm/monstervfs-blocklog.img', state + '/ack'
+name, mount = 'monstervfs-blocklog', '/mnt/monstervfs-blocklog'
+FLUSH, FUA, DISCARD, MARK = 1, 2, 4, 8
+def sh(*a, check=True, **k): return subprocess.run(a, check=check, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **k)
+def clean():
+    sh('umount', mount, check=False); sh('dmsetup', 'remove', name, check=False)
+clean(); sh('modprobe', 'dm_log_writes')
+for image, size in ((data, SIZE), (log, 3 << 30)): sh('truncate', '-s', str(size), image)
+L1 = sh('losetup', '-f', '--show', data).stdout.strip(); L2 = sh('losetup', '-f', '--show', log).stdout.strip()
+sectors = int(sh('blockdev', '--getsz', L1).stdout)
+sh('dmsetup', 'create', name, '--table', f'0 {sectors} log-writes {L1} {L2}')
+device = '/dev/mapper/' + name
+mkfs = ('mkfs.ext4', '-q', '-F', '-E', 'nodiscard', device) if args.fs == 'ext4' else ('mkfs.' + args.fs, '-q', '-f', device)
+sh(*mkfs); sh('dmsetup', 'message', name, '0', 'mark', 'mkfs')
+os.makedirs(mount, exist_ok=True)
+mountopts = ('-o', args.options) if args.options else ()
+sh('mount', '-t', args.fs, *mountopts, device, mount); os.sync()
+sh('dmsetup', 'message', name, '0', 'mark', 'start')
+db = mount + '/db'
+r = subprocess.run([binary, 'script', library, args.vfs, db, ack, '0'], capture_output=True, text=True)
+print('script exit', r.returncode, r.stderr[:200], flush=True)
+script_failed = r.returncode != 0
+sh('dmsetup', 'message', name, '0', 'mark', 'end'); sh('umount', mount)
+sh('dmsetup', 'suspend', name); sh('dmsetup', 'resume', name); sh('dmsetup', 'remove', name)
+sh('losetup', '-d', L1); sh('losetup', '-d', L2)
+# ---- Parse the log: a superblock, then entries each with a one-sector header.
+f = open(log, 'rb'); m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+magic, version, count, sectorsize = struct.unpack_from('<QQQI', m, 0)
+assert magic == 0x6a736677736872, hex(magic)
+at = sectorsize; entries = []
+for index in range(count):
+    sector, nr, flags, length = struct.unpack_from('<QQQQ', m, at)
+    text = bytes(m[at + 32:at + 32 + length]).decode() if flags & MARK and length else ''
+    entries.append((sector, nr, flags, at + sectorsize, text))
+    at += sectorsize + (0 if flags & DISCARD else nr * 512)
+print(f'{count} log entries', flush=True)
+start = next(i for i, e in enumerate(entries) if e[4] == 'start')
+image = bytearray(SIZE)
+def apply(entry):
+    sector, nr, flags, where, _ = entry
+    if not nr: return
+    if flags & DISCARD: image[sector * 512:(sector + nr) * 512] = bytes(nr * 512)
+    else: image[sector * 512:(sector + nr) * 512] = m[where:where + nr * 512]
+for entry in entries[:start]: apply(entry)
+flushes = [i for i in range(start, count) if entries[i][2] & (FLUSH | FUA)]
+rng = random.Random(args.seed)
+others = [i for i in range(start, count) if i not in set(flushes) and entries[i][1]]
+chosen = sorted(set(flushes + rng.sample(others, min(len(others), max(0, args.points - len(flushes))))))
+print(f'{len(flushes)} flush points, {len(chosen)} crash points', flush=True)
+stats = collections.Counter(); failures = collections.Counter(); first = {}
+def verify(acked, label):
+    with open(shot, 'wb') as out: out.write(image)
+    if os.path.exists(ack): os.unlink(ack)
+    if acked:
+        with open(ack, 'wb') as out: out.write(struct.pack('<q', acked))
+    try:
+        r = sh('mount', '-t', args.fs, '-o', 'loop' + (',' + args.options if args.options else ''), shot, mount, check=False)
+        if r.returncode:
+            stats['filesystem would not mount'] += 1; return
+        try:
+            result = subprocess.run([binary, 'check', library, args.vfs, db, ack, '0'], capture_output=True, text=True, timeout=60)
+            line = result.stdout.strip() or f'CRASH exit={result.returncode} {result.stderr[:90]}'
+        except subprocess.TimeoutExpired:
+            line = 'FAIL timeout'
+        stats[label] += 1
+        if line.startswith('OK'):
+            stats['ok'] += 1; stats[line.split()[1].split('=')[0]] += 1
+        else:
+            kind = ' '.join(line.split()[:3]); failures[kind] += 1
+            first.setdefault(kind, f'{label} {line}')
+    finally:
+        sh('umount', mount, check=False)
+acked = 0; next_point = 0; epoch = []; before = []
+wanted = set(chosen)
+def reorder():
+    """A write cache may have finished any subset of what has not been flushed."""
+    global image
+    if len(epoch) < 2: return
+    lost = {i for i in epoch if rng.random() < .5}
+    if not lost or len(lost) == len(epoch): return
+    saved = bytearray(image)
+    for sector, old in reversed(before): image[sector * 512:sector * 512 + len(old)] = old
+    for i in epoch:
+        if i not in lost: apply(entries[i])
+    verify(acked, 'reordered')
+    image = saved
+for index in range(start, count):
+    entry = entries[index]
+    if entry[2] & MARK and entry[4].startswith('ack-'): acked = int(entry[4][4:])
+    if entry[2] & FLUSH:
+        if index in wanted: reorder()
+        epoch = []; before = []            # Everything before a flush is durable.
+    # A FUA write is durable when it completes, so a cache cannot lose it.
+    if entry[1] and not entry[2] & FUA:
+        before.append((entry[0], bytes(image[entry[0] * 512:(entry[0] + entry[1]) * 512])))
+        epoch.append(index)
+    apply(entry)
+    if index in wanted: verify(acked, 'in order')
+print(json.dumps({'vfs': args.vfs, 'fs': args.fs, 'options': args.options, 'entries': count, 'flushes': len(flushes), 'stats': dict(stats), 'failures': dict(failures), 'first': first}, indent=1))
+m.close(); f.close(); shutil.rmtree(state)
+if os.path.exists(shot): os.unlink(shot)
+# A workload that stopped early leaves fewer crash points, which would look like a pass.
+sys.exit(1 if failures or script_failed else 0)

@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Exercise registration failures with the pinned SQLite host's actual API table."""
+import argparse
+import os
+import pathlib
+import shlex
+import resource
+import signal
+import subprocess
+import sys
+import tempfile
+
+import mvbuild
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--library', help='existing loadable extension; otherwise build the selected codec')
+parser.add_argument('--mode', choices=('auto-unload', 'auto-retry', 'concurrent', 'publish-abort'))
+args = parser.parse_args()
+root = mvbuild.root
+host = root / 'target/sqlite'
+if not (host / 'sqlite3.o').exists():
+    subprocess.run([str(root / 'tools/build-host')], check=True)
+library = mvbuild.library(args.library)
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+executable = mvbuild.host / 'registration'
+subprocess.run(cc + mvbuild.CFLAGS + ['-std=c11', '-Wall', '-Wextra', '-Werror',
+    '-I' + str(root / 'vendor/sqlite'), str(root / 'tests/build/registration.c'),
+    str(host / 'sqlite3.o')] + libs + ['-o', str(executable)], check=True)
+modes = [args.mode] if args.mode else ['auto-unload', 'auto-retry', 'concurrent', 'publish-abort']
+with tempfile.TemporaryDirectory(prefix='monstervfs-registration-') as directory:
+    for mode in modes:
+        command = [str(executable), library, mode, str(pathlib.Path(directory) / (mode + '.db'))]
+        if mode == 'publish-abort':
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                    preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))
+            if result.returncode != -signal.SIGABRT or 'injected impossible VFS publication failure' not in result.stderr:
+                raise SystemExit(f'publication failure did not abort as required: {result.returncode}\n{result.stderr}')
+            print('registration publish-abort passed')
+        else:
+            subprocess.run(command, check=True, timeout=30)

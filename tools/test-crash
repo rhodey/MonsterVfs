@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Rebuild permitted power-loss states from real SQLite I/O and reopen each one.
+
+Everything covered by a file's last fsync survives. Operations since then may be
+lost or torn at 4 KiB boundaries, matching the alignment Q in ARCH.md. Beyond that,
+this applies what SQLite's documentation assumes of a power loss: a write that grows a
+file may leave the new size with none of its bytes, an interrupted sector may read back
+as zeros or ones, and a deletion may not last. The native VFS runs first as a control:
+a failure there leaves attribution unresolved and requires investigation.
+
+A sample of images is reopened read-only and in exclusive mode as well. A few crash states
+then get a further session of their own, exclusive and then shared, with crashes inside
+those too, because some states only exist after a second or third crash."""
+import argparse, collections, concurrent.futures, itertools, os, pathlib, random, shlex, shutil
+import subprocess, sys, tempfile
+import mvbuild
+
+PAGE = 4096
+WORKLOADS = {'standard': (30, 0), 'hard': (12, 1), 'vacuum': (8, 2)}
+RESUME_EXCLUSIVE, RESUME_SHARED = 3, 4
+root = pathlib.Path(__file__).resolve().parent.parent
+host = root/'target/sqlite'
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--seeds', type=int, default=1, help='random image sets per workload')
+parser.add_argument('--busy-ms', type=int, default=5000, help='busy timeout for the reopening process')
+parser.add_argument('--workload', choices=[*WORKLOADS, 'all'], default='all')
+parser.add_argument('--library', help='extension to test; defaults to the debug build')
+parser.add_argument('--skip-control', action='store_true', help='omit the native VFS control')
+parser.add_argument('--every', type=int, default=16, help='also reopen every Nth image read-only and exclusive')
+parser.add_argument('--chains', type=int, default=16, help='crash states per run that get further sessions')
+args = parser.parse_args()
+
+def build():
+    source = host/'sqlite-amalgamation-3540000/sqlite3.c'
+    if not source.exists() or not (host/'sqlite3.o').exists():
+        subprocess.run([str(root/'tools/build-host')], check=True)
+    cc = shlex.split(os.environ.get('CC', 'cc'))
+    libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+    include = '-I'+str(root/'vendor/sqlite')
+    obj = host/'sqlite3-crash.o'
+    if not obj.exists() or obj.stat().st_mtime < source.stat().st_mtime:
+        subprocess.run(cc + ['-O1', '-g', '-DSQLITE_THREADSAFE=1', '-DSQLITE_ENABLE_DBPAGE_VTAB',
+            '-Dfsync=mvfs_crash_fsync', '-Dfdatasync=mvfs_crash_fdatasync',
+            '-c', str(source), '-o', str(obj)], check=True)
+    subprocess.run(cc + mvbuild.CFLAGS + ['-O1', '-g', include, str(root/'tests/crash/record.c'), str(obj)] + libs
+        + ['-o', str(mvbuild.host/'crash-record')], check=True)
+    subprocess.run(cc + mvbuild.CFLAGS + ['-O1', '-g', include, str(root/'tests/crash/check.c'), str(host/'sqlite3.o')] + libs
+        + ['-o', str(mvbuild.host/'crash-check')], check=True)
+
+def apply(content, operation, chunks=None):
+    if operation[0] == 'T':
+        length = operation[1]
+        if length < len(content): del content[length:]
+        else: content.extend(bytes(length - len(content)))
+        return
+    offset, data = operation[1], operation[2]
+    for low, high in (chunks if chunks is not None else [(0, len(data))]):
+        at = offset + low
+        if len(content) < at: content.extend(bytes(at - len(content)))
+        content[at:at + high - low] = data[low:high]
+
+def junk(length):
+    return bytes((index * 37 + 11) & 255 for index in range(length))
+
+def pages(offset, length):
+    chunks, at = [], 0
+    while at < length:
+        step = min(PAGE - (offset + at) % PAGE, length - at)
+        chunks.append((at, at + step))
+        at += step
+    return chunks
+
+class File:
+    def __init__(self):
+        self.durable = bytearray()
+        self.pending = []
+
+def image(files, kind, detail=None):
+    """Materialize every file as a crash at this point could leave it."""
+    result = {}
+    for path, file in files.items():
+        content = bytearray(file.durable)
+        pending = file.pending
+        if kind == 'clean':
+            for operation in pending: apply(content, operation)
+        elif kind == 'random':
+            for operation in pending:
+                if operation[0] == 'T':
+                    if detail.random() < .5: apply(content, operation)
+                else:
+                    apply(content, operation, [c for c in pages(operation[1], len(operation[2]))
+                                               if detail.random() < .5])
+        elif kind.startswith('tear'):
+            torn = detail[0] == path and pending
+            for operation in (pending[:-1] if torn else pending): apply(content, operation)
+            if torn: apply(content, pending[-1], detail[1])
+        elif kind.startswith('sector'):
+            # An interrupted sector can read back as zeros or ones, not just old or new.
+            hit = detail[0] == path and pending
+            for operation in (pending[:-1] if hit else pending): apply(content, operation)
+            if hit:
+                offset, data = pending[-1][1], pending[-1][2]
+                apply(content, pending[-1])
+                low, high = detail[1]
+                content[offset + low:offset + high] = detail[2](high - low)
+        elif kind == 'wild':
+            for operation in pending:
+                if operation[0] == 'T':
+                    if detail.random() < .5: apply(content, operation)
+                    continue
+                for low, high in pages(operation[1], len(operation[2])):
+                    choice = detail.random()
+                    if choice < .35: continue
+                    apply(content, operation, [(low, high)])
+                    if choice >= .7:
+                        at = operation[1] + low
+                        filler = bytes(high - low) if choice < .85 else b'\xff' * (high - low)
+                        content[at:at + high - low] = filler
+        elif kind.startswith('grown'):
+            grown = detail[0] == path and pending
+            for operation in (pending[:-1] if grown else pending): apply(content, operation)
+            if grown:
+                end = pending[-1][1] + len(pending[-1][2])
+                content.extend(detail[1](max(0, end - len(content))))
+        result[path] = content
+    return result
+
+def images(events, payloads, seed, files=None, acknowledged=-1, light=False):
+    """Yield (operation index, variant, acknowledged commits, files) at every crash point.
+    A later session starts from the files a crash left; light skips the rarer variants."""
+    files = {} if files is None else files
+    for index, event in enumerate(events):
+        kind = event[0]
+        if kind == 'A':
+            acknowledged = int(event[1])
+            continue
+        path = event[1]
+        if kind == 'O':
+            files.setdefault(path, File())
+        elif kind == 'W':
+            offset, length, at = int(event[2]), int(event[3]), int(event[4])
+            files.setdefault(path, File()).pending.append(('W', offset, payloads[at:at + length]))
+        elif kind == 'T':
+            files.setdefault(path, File()).pending.append(('T', int(event[2])))
+        elif kind == 'S':
+            file = files.setdefault(path, File())
+            for operation in file.pending: apply(file.durable, operation)
+            file.pending = []
+        elif kind == 'U':
+            # SQLite does not sync the directory here, so a deletion can be undone.
+            yield index, 'undeleted', acknowledged, image(files, 'clean')
+            yield index, 'undeleted-none', acknowledged, image(files, 'none')
+            files.pop(path, None)
+        yield index, 'clean', acknowledged, image(files, 'clean')
+        yield index, 'none', acknowledged, image(files, 'none')
+        if kind == 'W':
+            chunks = pages(int(event[2]), int(event[3]))
+            for cut in range(1, len(chunks)):
+                yield index, 'tear-prefix', acknowledged, image(files, 'tear', (path, chunks[:cut]))
+                yield index, 'tear-suffix', acknowledged, image(files, 'tear', (path, chunks[cut:]))
+            for chunk in chunks:
+                yield index, 'sector-zero', acknowledged, image(files, 'sector', (path, chunk, bytes))
+                if not light:
+                    yield index, 'sector-ones', acknowledged, image(files, 'sector', (path, chunk, lambda n: b'\xff' * n))
+            if not light:
+                yield index, 'grown-zero', acknowledged, image(files, 'grown', (path, bytes))
+                yield index, 'grown-junk', acknowledged, image(files, 'grown', (path, junk))
+        if light: continue
+        generator = random.Random(seed*100003 + index)
+        yield index, 'random', acknowledged, image(files, 'random', generator)
+        yield index, 'wild', acknowledged, image(files, 'wild', generator)
+
+def materialize(files, directory):
+    """Write out the image, and return its database path, if it has one."""
+    if directory.exists(): shutil.rmtree(directory)
+    directory.mkdir()
+    database = None
+    for path, content in files.items():
+        target = directory/pathlib.Path(path).name
+        target.write_bytes(content)
+        if target.name == 'database': database = target
+    return database
+
+def verify(work, library, vfs, number, item):
+    index, variant, acknowledged, files = item
+    directory = pathlib.Path(work)/str(number)
+    reopens = ['readonly', 'exclusive', 'shared'] if number % args.every == 0 else ['shared']
+    try:
+        for reopen in reopens:
+            database = materialize(files, directory)
+            if database is None: return variant, acknowledged, 'OK no database yet', index
+            try:
+                result = subprocess.run([str(mvbuild.host/'crash-check'), library, vfs, str(database),
+                    str(acknowledged), str(args.busy_ms), reopen], capture_output=True, text=True, timeout=60)
+                line = result.stdout.strip()
+                if result.returncode or not line:
+                    line = f'CRASH exit={result.returncode} {line[:120]} {result.stderr[:120]}'
+            except subprocess.TimeoutExpired:
+                line = 'FAIL timeout'
+            if not line.startswith('OK'): return f'{variant}/{reopen}', acknowledged, line, index
+        return variant, acknowledged, line, index
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+def sweep(pool, work, library, vfs, numbers, items, events, tally, keep=0, wanted=None, generator=None):
+    """Reopen every image, and hold back a random few that wanted accepts."""
+    kept, eligible, pending = [], 0, set()
+    for item in items:
+        if keep and wanted(item, events):
+            eligible += 1
+            if len(kept) < keep: kept.append(item)
+            elif (slot := generator.randrange(eligible)) < keep: kept[slot] = item
+        pending.add(pool.submit(verify, work, library, vfs, next(numbers), item))
+        if len(pending) >= 256:
+            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            collect(done, *tally, events)
+    collect(concurrent.futures.wait(pending).done, *tally, events)
+    return kept
+
+def torn_wal(item, events):
+    return (item[2] > 0 and item[1].startswith(('tear', 'sector'))
+            and events[item[0]][0] == 'W' and events[item[0]][1].endswith('-wal'))
+
+def during_checkpoint(item, events):
+    event = events[item[0]]
+    return item[1] == 'clean' and event[0] in ('W', 'S') and not event[1].endswith('-wal')
+
+def resume(item, base, library, vfs, mode, seed, tally):
+    """Run a session on a crash image. Return its events and every crash inside it."""
+    index, variant, acknowledged, files = item
+    run = base/f'resume-{next(sessions)}'
+    run.mkdir()
+    materialize(files, run/'files')
+    log, blob = run/'events', run/'payloads'
+    result = subprocess.run([str(mvbuild.host/'crash-record'), library, vfs, str(run/'files/database'), str(log),
+        str(blob), '3', '0', str(mode)], capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        tally[0]['failed'] += 1
+        tally[1][('session', variant, result.stderr.strip()[:60])] += 1
+        return [], ()
+    events = [line.split() for line in log.read_text().splitlines()]
+    start = {str(run/'files'/pathlib.Path(path).name): File() for path in files}
+    for path, content in files.items():
+        start[str(run/'files'/pathlib.Path(path).name)].durable = bytearray(content)
+    return events, images(events, blob.read_bytes(), seed, start, acknowledged, light=True)
+
+def campaign(library, vfs, workload, seed):
+    commits, mode = WORKLOADS[workload]
+    with tempfile.TemporaryDirectory(prefix='monstervfs-crash-') as temporary:
+        base = pathlib.Path(temporary).resolve()
+        log, blob = base/'events', base/'payloads'
+        (base/'run').mkdir()
+        (base/'images').mkdir()
+        subprocess.run([str(mvbuild.host/'crash-record'), library, vfs, str(base/'run/database'), str(log),
+            str(blob), str(commits), '8', str(mode)], check=True, timeout=300)
+        events = [line.split() for line in log.read_text().splitlines()]
+        payloads = blob.read_bytes()
+        results, failures = collections.Counter(), collections.Counter()
+        examples = {}
+        tally = (results, failures, examples)
+        numbers, generator = itertools.count(), random.Random(seed)
+        with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+            def check(items, events, keep=0, wanted=None):
+                return sweep(pool, base/'images', library, vfs, numbers, items, events, tally, keep, wanted, generator)
+            for first in check(images(events, payloads, seed), events, args.chains, torn_wal):
+                events2, crashes = resume(first, base, library, vfs, RESUME_EXCLUSIVE, seed, tally)
+                for second in check(crashes, events2, 2, during_checkpoint):
+                    events3, crashes3 = resume(second, base, library, vfs, RESUME_SHARED, seed, tally)
+                    check(crashes3, events3)
+    return results, failures, examples
+
+def collect(done, results, failures, examples, events):
+    for future in done:
+        variant, acknowledged, line, index = future.result()
+        if line.startswith('OK'):
+            results['ok'] += 1
+            continue
+        results['failed'] += 1
+        phase = 'setup' if acknowledged < 0 else 'data'
+        key = (phase, variant, ' '.join(line.split()[:3]))
+        failures[key] += 1
+        examples.setdefault(key, (index, [part.rsplit('/', 1)[-1] for part in events[index][:4]], acknowledged, line))
+
+sessions = itertools.count()
+build()
+library = mvbuild.library(args.library)
+selected = list(WORKLOADS) if args.workload == 'all' else [args.workload]
+broken = False
+for vfs in ([] if args.skip_control else ['unix']) + [mvbuild.VFS]:
+    for workload in selected:
+        for seed in range(1, args.seeds + 1):
+            results, failures, examples = campaign(library, vfs, workload, seed)
+            total = results['ok'] + results['failed']
+            print(f'{vfs} {workload} seed {seed}: {total} images, {results["failed"]} failed', flush=True)
+            for key, count in sorted(failures.items()):
+                broken = True
+                print(f'  {count} {key} first at {examples[key]}')
+if broken: raise SystemExit('crash images failed')
+print('Crash images passed: acknowledged commits survive and every image reopens.')

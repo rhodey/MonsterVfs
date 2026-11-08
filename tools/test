@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Build and exercise each build of the standalone VFS; upstream Tcl tests are separate."""
+import argparse, os, pathlib, subprocess, sys
+import mvbuild
+root = mvbuild.root
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--build', choices=['parity', 'copy'], help='run one build instead of both')
+arguments = parser.parse_args()
+def run(command, build=None):
+    print('+ '+' '.join(command), flush=True)
+    environment = {**os.environ, **({'MONSTERVFS_BUILD': build} if build else {})}
+    subprocess.run(command, cwd=root, check=True, env=environment)
+run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests/tools'])
+run(['cargo', 'fmt', '--all', '--check'])
+for build in [arguments.build] if arguments.build else ['parity', 'copy']:
+    features = mvbuild.cargo(build=build)
+    tools = 'build integration maintenance lifecycle faults damage metadata large soak readonly stress'.split()
+    run(['cargo', 'test', '--lib', *features], build)
+    run(['cargo', 'clippy', '--tests', *features, '--', '-D', 'warnings'], build)
+    run([str(root/'tools/build-host'), '--static'], build)
+    for tool in tools:
+        run([str(root/f'tools/test-{tool}')], build)
+    run([str(root/'tools/test-crash'), '--library', f'target/{build}/loadable/release/libmonstervfs_{build}.{mvbuild.SUFFIX}'], build)
+if not arguments.build:
+    run([str(root/'tools/test-builds')])
+    run([str(root/'tools/test-lifecycle'), '--both'])
+run(['git', 'diff', '--check'])
+print('Standalone validation passed. Run tools/test-sqlite separately for the documented upstream selection.')

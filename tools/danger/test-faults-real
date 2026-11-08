@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Failures a real kernel produces, against the native VFS. Linux, as root.
+
+A read-only filesystem gives EROFS, a full disk gives ENOSPC, and device-mapper turns exact
+sectors of a file into real I/O errors. Each must end the way the policy says: as native
+does for the first two, and for bad sectors, opening unless nothing consistent is left."""
+import json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile
+root = pathlib.Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(root/'tools'))
+import mvbuild
+from faults_verdict import matches
+if '--may-hang-this-host' not in sys.argv:
+    sys.exit('This can hang the kernel until a reboot. Read tools/danger/README.md, then pass --may-hang-this-host.')
+if sys.platform != 'linux' or os.geteuid() != 0:
+    sys.exit('run as root on Linux: this drives device-mapper and mounts')
+library = str(mvbuild.released())
+if not pathlib.Path(library).exists() or not (root/'target/sqlite/sqlite3.o').exists():
+    sys.exit('build first: tools/build-host, then tools/smoke')
+fx = str(mvbuild.host/'faults-real')
+subprocess.run(shlex.split(os.environ.get('CC', 'cc')) + mvbuild.CFLAGS + ['-O1', '-g', '-w', '-I'+str(root/'vendor/sqlite'), str(root/'tests/danger/faults.c'),
+    str(root/'target/sqlite/sqlite3.o'), '-lpthread', '-lm', '-ldl', '-o', fx], check=True)
+state = tempfile.mkdtemp(prefix='monstervfs-faults-', dir='/var/tmp')
+mount, image, name = '/mnt/monstervfs-faults', state + '/device.img', 'monstervfs-faults'
+VFSES = ('unix', mvbuild.VFS)
+problems = []
+def sh(*a, check=True, **k): return subprocess.run(a, check=check, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **k)
+def run(mode, vfs, db, *rest, timeout=30):
+    try:
+        r = subprocess.run([fx, mode, library, vfs, db, *rest], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 'TIMEOUT'
+    return (r.stdout.strip() or '') + (f' [exit {r.returncode}{" " + r.stderr.strip()[:60] if r.stderr.strip() else ""}]' if r.returncode else '')
+def teardown():
+    sh('umount', mount, check=False); sh('dmsetup', 'remove', name, check=False)
+    for line in sh('losetup', '-j', image, check=False).stdout.splitlines(): sh('losetup', '-d', line.split(':')[0], check=False)
+def setup(megabytes):
+    teardown(); sh('rm', '-f', image); sh('truncate', '-s', f'{megabytes}M', image)
+    loop = sh('losetup', '-f', '--show', image).stdout.strip(); sectors = int(sh('blockdev', '--getsz', loop).stdout)
+    sh('dmsetup', 'create', name, '--table', f'0 {sectors} linear {loop} 0')
+    sh('mkfs.ext4', '-q', '-F', '-m', '0', '/dev/mapper/' + name); os.makedirs(mount, exist_ok=True); sh('mount', '/dev/mapper/' + name, mount)
+    return loop, sectors
+def flip(path, at, n=80):
+    with open(path, 'r+b') as f:
+        f.seek(at); b = bytearray(f.read(n)); f.seek(at); f.write(bytes(x ^ 0x5a for x in b))
+def wipe(db):
+    for s in ('', '-wal', '-shm'):
+        if os.path.exists(db + s): os.unlink(db + s)
+out = {}
+def section(title): out[title] = []; return out[title]
+def row(rows, label, **cells): rows.append({'case': label, **cells}); print(label, cells, flush=True)
+# ---- A really read-only filesystem: EROFS, which no permission bit can imitate.
+rows = section('read-only filesystem')
+setup(128)
+for scenario in ('clean', 'wal', 'wal, no -shm', 'wal, damaged frame'):
+    cells = {}
+    for vfs in VFSES:
+        db = f'{mount}/{vfs}'; sh('mount', '-o', 'remount,rw', mount); wipe(db)
+        run('make-clean' if scenario == 'clean' else 'make-wal', vfs, db)
+        if 'no -shm' in scenario: os.unlink(db + '-shm')
+        if 'damaged' in scenario:
+            if vfs == mvbuild.VFS:
+                flip(db + '-wal', 16384 + 10 * 8192 + 4072 + 100)
+                # A frame in `copy` needs both copies damaged to match a lost native frame.
+                if mvbuild.NAME == 'copy': flip(db + '-wal', 16384 + 10 * 8192 + 100)
+            else: flip(db + '-wal', 32 + 10 * 4120 + 1000)
+        os.sync(); sh('mount', '-o', 'remount,ro', mount)
+        for label, uri, how in (('mode=ro', f'file:{db}?mode=ro', 'ro'), ('immutable', f'file:{db}?immutable=1', 'ro'), ('plain', db, 'rw')):
+            cells[f'{vfs} {label}'] = run('try', vfs, uri, how)
+    for label in ('mode=ro', 'immutable', 'plain'):
+        same = cells[f'unix {label}'] == cells[f'{mvbuild.VFS} {label}']
+        row(rows, f'{scenario} / {label}', unix=cells[f'unix {label}'], monstervfs=cells[f'{mvbuild.VFS} {label}'], same=same)
+        if not same: problems.append(f'read-only filesystem, {scenario} / {label}')
+# ---- A really full disk: ENOSPC, on the write that hits it.
+rows = section('full disk')
+for vfs in VFSES:
+    setup(48)
+    db, ack = f'{mount}/db', f'{state}/ack-{vfs}'
+    sh('dd', 'if=/dev/zero', f'of={mount}/filler', 'bs=1M', 'count=8', 'conv=fsync', check=False)
+    stopped = run('fill', vfs, db, ack, timeout=120)
+    row(rows, f'{vfs}: commit until the disk is full', result=stopped)
+    row(rows, f'{vfs}: read-only open, disk still full', result=run('try', vfs, f'file:{db}?mode=ro', 'ro'))
+    os.unlink(f'{mount}/filler'); os.sync()
+    result = run('acked', vfs, db, ack)
+    row(rows, f'{vfs}: space freed, reopen', result=result)
+    held = re.match(r'acked=(\d+) count=(\d+) integrity=ok', result)
+    if not held or held[1] != held[2]: problems.append(f'full disk, {vfs}: {result}')
+for vfs in VFSES:
+    setup(48)
+    db = f'{mount}/db'; run('make-clean', vfs, db)
+    sh('dd', 'if=/dev/zero', f'of={mount}/filler', 'bs=1M', 'conv=fsync', check=False)
+    row(rows, f'{vfs}: cold open, disk already full, read-only', result=run('try', vfs, f'file:{db}?mode=ro', 'ro'))
+    row(rows, f'{vfs}: cold open, disk already full, read/write', result=run('try', vfs, db, 'rw'))
+    os.unlink(f'{mount}/filler'); os.sync()
+    row(rows, f'{vfs}: cold open, space freed', result=run('try', vfs, db, 'rw'))
+# ---- Real bad sectors: EIO from the block layer, at an exact place in the file.
+def extents(path):
+    text = sh('filefrag', '-b512', '-e', '-v', path).stdout; found = []
+    for line in text.splitlines():
+        m = re.match(r'\s*\d+:\s+(\d+)\.\.\s*(\d+):\s+(\d+)\.\.\s*(\d+):', line)
+        if m: found.append((int(m[1]), int(m[3]), int(m[2]) - int(m[1]) + 1))
+    return found
+def sector_of(path, byte):
+    want = byte // 512
+    for logical, physical, length in extents(path):
+        if logical <= want < logical + length: return physical + want - logical
+    raise SystemExit(f'no extent for {path} at {byte}')
+def bad(loop, sectors, at, count=8):
+    tail = sectors - at - count
+    t = f'0 {at} linear {loop} 0\n{at} {count} error\n{at + count} {tail} linear {loop} {at + count}\n'
+    sh('dmsetup', 'suspend', name); sh('dmsetup', 'load', name, input=t) if False else subprocess.run(['dmsetup', 'load', name], input=t, text=True, check=True)
+    sh('dmsetup', 'resume', name)
+def good(loop, sectors):
+    sh('dmsetup', 'suspend', name); sh('dmsetup', 'load', name, '--table', f'0 {sectors} linear {loop} 0'); sh('dmsetup', 'resume', name)
+rows = section('bad sectors')
+# Each ends as the policy says: a lost copy or metadata sector changes nothing, a lost frame cuts, and an
+# unreadable control record stops recovery with that error only if it may be the current one. Here the frames
+# belong to the newest. The second sector of a slot is the page in
+# `parity`, where losing it loses the slot, and just the other copy in `copy`.
+INTACT = 'count=20 bytes=60000 integrity=ok'
+SECOND = {'main': INTACT, 'main one': INTACT, 'wal': 'count=50 bytes=150000 integrity=ok'} if mvbuild.NAME == 'copy' else \
+         {'main': 'count=E11', 'main one': 'count=E8458', 'wal': 'count=23 bytes=69000 integrity=ok'}
+CASES = [
+ ('main page, its data sector', 'main', lambda p: 8192 + 4 * 8192 + 4096, lambda p: 4 * 4096, SECOND['main']),
+ ('main page, its header sector', 'main', lambda p: 8192 + 4 * 8192, None, 'count=20 bytes=60000 integrity=ok'),
+ ('main page one, data sector', 'main', lambda p: 8192 + 4096, lambda p: 0, SECOND['main one']),
+ ('main page one, header sector', 'main', lambda p: 8192, None, 'count=20 bytes=60000 integrity=ok'),
+ ('main file header, first copy', 'main', lambda p: 0, None, 'count=20 bytes=60000 integrity=ok'),
+ ('main file header, second copy', 'main', lambda p: 4096, None, 'count=20 bytes=60000 integrity=ok'),
+ ('WAL frame, data sector, during recovery', 'wal', lambda p: 16384 + 10 * 8192 + 4096, lambda p: 32 + 10 * 4120 + 24, SECOND['wal']),
+ ('WAL frame, header sector, during recovery', 'wal', lambda p: 16384 + 10 * 8192, None, 'count=50 bytes=150000 integrity=ok'),
+ ('last WAL frame, data sector', 'wal', lambda p: 16384 + 29 * 8192 + 4096, lambda p: 32 + 29 * 4120 + 24, 'integrity=ok'),
+ ('WAL file header, first copy', 'wal', lambda p: 0, None, 'count=50 bytes=150000 integrity=ok'),
+ ('WAL file header, second copy', 'wal', lambda p: 4096, None, 'count=50 bytes=150000 integrity=ok'),
+ ('WAL control record, older', 'wal', lambda p: 8192, None, 'count=50 bytes=150000 integrity=ok'),
+ ('WAL control record, newest', 'wal', lambda p: 12288, None, 'count=E8458'),
+]
+for label, which, mv, native, expected in CASES:
+    cells = {}
+    for vfs in VFSES:
+        offset = mv if vfs == mvbuild.VFS else native
+        if offset is None: cells[vfs] = 'no such sector'; continue
+        loop, sectors = setup(128)
+        db = f'{mount}/db'; run('make-clean' if which == 'main' else 'make-wal', vfs, db); os.sync()
+        path = db if which == 'main' else db + '-wal'
+        target = sector_of(path, offset(path)) & ~7
+        sh('umount', mount); bad(loop, sectors, target); sh('mount', '/dev/mapper/' + name, mount)
+        outcomes = {'ro': run('try', vfs, f'file:{db}?mode=ro', 'ro'),
+                    'rw': run('try', vfs, db, 'rw')}
+        cells[vfs] = outcomes
+        if vfs == mvbuild.VFS:
+            for access, result in outcomes.items():
+                if not matches(result, expected):
+                    problems.append(f'bad sector, {label}, {access}: {result}')
+        sh('umount', mount, check=False); good(loop, sectors)
+    row(rows, label, unix=cells['unix'], monstervfs=cells[mvbuild.VFS])
+# ---- Our control rewrite must fail before checkpoint data can reach main.
+# Both controls describe the same WAL generation. This differs from the older
+# cases above, where rejecting an unreadable newer-generation header is required.
+rows = section('control failure preserves committed data')
+for locking in ('normal', 'exclusive'):
+    for selected in ('older', 'newest'):
+        label = f'{selected} same-generation control / {locking}'
+        loop, sectors = setup(128)
+        db = f'{mount}/db'
+        prepared = run('make-control-wal', mvbuild.VFS, db)
+        if not matches(prepared, 'rows=50'):
+            problems.append(f'{label}: setup failed: {prepared}')
+            row(rows, label, setup=prepared)
+            continue
+        os.sync()
+        main, wal = pathlib.Path(db), pathlib.Path(db + '-wal')
+        before_main, before_wal = main.read_bytes(), wal.read_bytes()
+        controls = [before_wal[at:at + 128] for at in (8192, 12288)]
+        sequences = [int.from_bytes(control[8:16], 'little') for control in controls]
+        if (any(len(control) != 128 or control[:8] != b'MVFSCTRL' for control in controls)
+                or controls[0][16:48] != controls[1][16:48]
+                or abs(sequences[0] - sequences[1]) != 1):
+            problems.append(f'{label}: setup did not create adjacent same-generation controls')
+            row(rows, label, setup=prepared, sequences=sequences)
+            continue
+        region = sequences.index(min(sequences) if selected == 'older' else max(sequences))
+        target = sector_of(str(wal), 8192 + region * 4096) & ~7
+        saved = pathlib.Path(state) / f'control-{selected}-{locking}'
+        saved.mkdir()
+        (saved / 'before-main').write_bytes(before_main)
+        (saved / 'before-wal').write_bytes(before_wal)
+        sh('umount', mount)
+        try:
+            bad(loop, sectors, target)
+            sh('mount', '/dev/mapper/' + name, mount)
+            failed = run('fail-control-checkpoint', mvbuild.VFS, db, locking)
+        finally:
+            # Restore the device even if mounting or the child fails. Reread only
+            # after remounting, so neither EIO nor cached pages can mask changes.
+            sh('umount', mount, check=False)
+            good(loop, sectors)
+            sh('mount', '/dev/mapper/' + name, mount)
+        after_main = main.read_bytes()
+        after_wal = wal.read_bytes() if wal.exists() else None
+        (saved / 'after-main').write_bytes(after_main)
+        if after_wal is not None: (saved / 'after-wal').write_bytes(after_wal)
+        unchanged = {
+            'main': after_main == before_main,
+            'wal_length': after_wal is not None and len(after_wal) == len(before_wal),
+            'wal_prefix': after_wal is not None and after_wal[:8192] == before_wal[:8192],
+            'wal_frames': after_wal is not None and after_wal[16384:] == before_wal[16384:],
+        }
+        reopened = run('reopen-control', mvbuild.VFS, db)
+        row(rows, label, setup=prepared, sequences=sequences, region=region,
+            failed=failed, unchanged=unchanged, reopened=reopened)
+        checkpoint = re.search(r'\bckpt=E(\d+)\b', failed)
+        if (not matches(failed, 'rows=50 close=0') or not checkpoint
+                or int(checkpoint[1]) & 255 != 10 or not all(unchanged.values())
+                or not matches(reopened, 'rows=50 write=ok ckpt=ok reopened=51 close=0')):
+            problems.append(f'{label}: checkpoint failure did not preserve committed data')
+
+# ---- A sector that refuses writes as well, which a page that survives now tries to repair.
+rows = section('bad sector that refuses writes')
+for label, which, offset in (('main page, its header sector', 'main', 8192 + 4 * 8192),
+                             ('main page, its data sector', 'main', 8192 + 4 * 8192 + 4096)):
+    loop, sectors = setup(128)
+    db = f'{mount}/db'; run('make-clean', mvbuild.VFS, db); os.sync()
+    target = sector_of(db, offset) & ~7
+    sh('umount', mount); bad(loop, sectors, target); sh('mount', '/dev/mapper/' + name, mount)
+    result = run('cycles', mvbuild.VFS, db, '5', timeout=60)
+    wal = os.stat(db + '-wal').st_size if os.path.exists(db + '-wal') else 0
+    row(rows, label, result=result, wal=wal)
+    # A failed checkpoint must not stop the connection, and repair must not loop.
+    if 'header' in label and ('again=E' in result or 'write=E' in result or 'write2=E' in result):
+        problems.append(f'bad sector that refuses writes, {label}: {result}')
+    sh('umount', mount, check=False); good(loop, sectors)
+teardown()
+if problems: print('Failure artifacts:', state, flush=True)
+else: shutil.rmtree(state)
+for problem in problems: print('FAILED', problem)
+print('Real faults ended as the policy says.' if not problems else f'{len(problems)} failed')
+sys.exit(1 if problems else 0)

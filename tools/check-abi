@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Check exported extension entry points and absence of a linked SQLite engine."""
+import pathlib, subprocess, sys
+import mvbuild
+library = pathlib.Path(sys.argv[1]).resolve()
+if sys.platform == 'darwin':
+    dependencies = subprocess.check_output(['otool', '-L', str(library)], text=True)
+    symbols = subprocess.check_output(['nm', '-g', str(library)], text=True)
+else:
+    dependencies = subprocess.check_output(['ldd', str(library)], text=True)
+    symbols = subprocess.check_output(['nm', '-D', str(library)], text=True)
+for line in dependencies.splitlines()[1:]:
+    if 'sqlite' in line.lower(): raise SystemExit('shared library links a second SQLite: '+line)
+for required in [mvbuild.ENTRY, 'monstervfs_shutdown']:
+    if required not in symbols: raise SystemExit('missing export '+required)
+for line in symbols.splitlines():
+    name = line.split()[-1].lstrip('_') if line.split() else ''
+    if name.startswith('sqlite3_') and name != mvbuild.ENTRY:
+        raise SystemExit('unexpected SQLite engine symbol: '+line)
+print('Extension ABI exports and dependencies passed')

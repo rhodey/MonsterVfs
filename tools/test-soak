@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Random damage against a database with a known history, in fresh copies.
+
+Each trial damages random sectors and byte runs of a template database and its WAL, then
+reopens the copy twice. Explicit read/open errors are allowed because damage can destroy
+data. Protected wrong data always requires investigation; a fault category never exempts
+it automatically. Native wrong data is counted separately for comparison. The same seed
+is replayable, but different layouts do not make physical faults logically equivalent."""
+import argparse, collections, concurrent.futures, hashlib, json, os, pathlib, random, shlex, shutil, subprocess, sys, tempfile
+import mvbuild
+from soak_verdict import evaluate, load_history
+from soak_followthrough import run as followthrough
+root = pathlib.Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--trials', type=int, default=400)
+parser.add_argument('--seed', type=int, default=1)
+parser.add_argument('--vfs', default=mvbuild.VFS)
+parser.add_argument('--library', help='extension to test; defaults to the debug build')
+parser.add_argument('--parity', type=int, help='parity bytes of the template')
+parser.add_argument('--keep', help='copy each failing trial here')
+parser.add_argument('--json', action='store_true')
+arguments = parser.parse_args()
+if arguments.trials <= 0:
+    parser.error('--trials must be positive')
+host = root/'target/sqlite'
+if not (host/'sqlite3.o').exists():
+    subprocess.run([str(root/'tools/build-host')], check=True)
+library = mvbuild.library(arguments.library)
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+binary = mvbuild.host/'soak'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O1', '-g', '-I'+str(root/'vendor/sqlite'), str(root/'tests/integration/soak.c'),
+    str(host/'sqlite3.o')] + libs + ['-o', str(binary)], check=True)
+subprocess.run([sys.executable, str(root/'tests/integration/soak_oracle.py'), str(binary), library],
+               check=True, timeout=120)
+subprocess.run([sys.executable, str(root/'tests/integration/soak_followthrough.py'), str(binary), library],
+               check=True, timeout=120)
+SECTOR = 4096
+def damage(path, generator, early, stale):
+    """Applies one random fault and describes it, so that a failure can be replayed."""
+    size = path.stat().st_size
+    # A whole slot gone stale is a valid older page, which nothing can detect, so at most
+    # one sector per trial loses its write.
+    kind = generator.choice(['zero', 'junk', 'flip', 'run', 'sectors', 'moved', 'cut', 'erased'] + (['stale'] * 3 if stale else []))
+    with open(path, 'r+b') as file:
+        at = generator.randrange(size // SECTOR) * SECTOR
+        if kind == 'zero': file.seek(at); file.write(bytes(SECTOR))
+        elif kind == 'cut':
+            at = generator.randrange(size // 2, size); file.truncate(at)
+        elif kind == 'moved':  # A write that landed on the wrong sector.
+            source = generator.randrange(size // SECTOR) * SECTOR
+            file.seek(source); block = file.read(SECTOR); file.seek(at); file.write(block)
+        elif kind == 'stale':  # One sector of an acknowledged write never reached the disk.
+            at = min(at, (early.stat().st_size // SECTOR - 1) * SECTOR)
+            with open(early, 'rb') as old: old.seek(at); block = old.read(SECTOR)
+            file.seek(at); file.write(block)
+        elif kind == 'junk': file.seek(at); file.write(generator.randbytes(SECTOR))
+        elif kind == 'erased':  # A whole slot of zeros, which verification cannot object to.
+            at -= at % (2 * SECTOR); file.seek(at); file.write(bytes(2 * SECTOR))
+        elif kind == 'sectors':
+            count = generator.randint(2, 4); file.seek(at); file.write(generator.randbytes(count * SECTOR))
+            return f'{path.name}:{kind}:{at}:{count}'
+        else:
+            at = generator.randrange(size - 400)
+            length = 1 if kind == 'flip' else generator.randint(2, 300)
+            file.seek(at); old = file.read(length); file.seek(at)
+            file.write(bytes(byte ^ (1 << generator.randrange(8) if kind == 'flip' else generator.randrange(1, 256)) for byte in old))
+    return f'{path.name}:{kind}:{at}'
+def invoke(*args):
+    try:
+        result = subprocess.run([str(binary), library, arguments.vfs, *map(str, args)],
+                                text=True, errors='replace', capture_output=True, timeout=120)
+        outcome = (result.returncode, result.stdout.strip(), result.stderr)
+    except subprocess.TimeoutExpired:
+        outcome = (None, '', '')
+    return outcome
+
+def check(database, history):
+    outcome = invoke('check', database)
+    return outcome, evaluate(*outcome, history=history, native=arguments.vfs == 'unix')
+
+def copy_database(source, destination):
+    shutil.copyfile(source, destination)
+    if os.path.exists(str(source) + '-wal'):
+        shutil.copyfile(str(source) + '-wal', str(destination) + '-wal')
+
+def trial(templates, history, history_path, work, number):
+    generator = random.Random(arguments.seed * 1000003 + number)
+    directory = work/str(number)
+    directory.mkdir()
+    main, wal = directory/'db', directory/'db-wal'
+    # One trial in three has main as the only copy of everything, so damage there counts.
+    template = templates[number % 3 == 0]
+    shutil.copyfile(template, main)
+    targets = [main]
+    if os.path.exists(str(template) + '-wal'):
+        shutil.copyfile(str(template) + '-wal', wal); targets = [main, wal, wal]
+    faults = []
+    for _ in range(generator.choice([1, 1, 1, 2, 2, 3])):
+        target = generator.choice(targets)
+        stale = target == main and not any(':stale:' in fault for fault in faults)
+        faults.append(damage(target, generator, pathlib.Path(str(templates[0]) + '.early'), stale))
+    if arguments.keep:
+        original = directory/'input'
+        original.mkdir()
+        for path in (main, wal):
+            if path.exists(): shutil.copyfile(path, original/path.name)
+    outcome, verdict = check(main, history)
+    later, evidence = None, None
+    if verdict.kind in ('exact-recovery', 'prefix-loss'):
+        later, evidence = followthrough(invoke, main, history, verdict.fields['commit'],
+                                       native=arguments.vfs == 'unix')
+    preserve = verdict.failed or verdict.kind == 'wrong-data' or (later is not None and later.kind != 'usable')
+    if preserve and arguments.keep:
+        saved = pathlib.Path(arguments.keep)/f'{arguments.seed}-{number}'
+        shutil.copytree(directory, saved)
+        shutil.copyfile(history_path, saved/'history.jsonl')
+        (saved/'result.json').write_text(json.dumps({
+            'seed': arguments.seed, 'trial': number, 'faults': faults,
+            'vfs': arguments.vfs, 'page': 4096, 'parity': arguments.parity,
+            'code': outcome[0], 'stdout': outcome[1], 'stderr': outcome[2],
+            'verdict': verdict.kind, 'reason': verdict.reason,
+            'library': str(pathlib.Path(library).resolve()),
+            'history_sha256': hashlib.sha256(history_path.read_bytes()).hexdigest(),
+            'followthrough': None if later is None else {
+                'verdict': later.kind, 'failed': later.failed, 'reason': later.reason,
+                'fields': later.fields, 'evidence': evidence},
+        }, indent=2) + '\n')
+    shutil.rmtree(directory)
+    # Ordered executor results must not retain megabyte transcripts behind a slow trial.
+    outcome = (outcome[0], outcome[1][-300:] if verdict.failed else '', outcome[2][-300:] if verdict.failed else '')
+    return number, faults, outcome, verdict, later
+stats, codes, follow_stats, failures = collections.Counter(), collections.Counter(), collections.Counter(), []
+with tempfile.TemporaryDirectory(prefix='monstervfs-soak-') as temporary:
+    work = pathlib.Path(temporary)
+    template, finished = work/'template', work/'finished'
+    history_path = work/'history.jsonl'
+    with history_path.open('w') as output:
+        subprocess.run([str(binary), library, arguments.vfs, 'prepare', str(template)],
+                       stdout=output, check=True, timeout=120,
+                       env={**os.environ, **({'SOAK_PARITY': str(arguments.parity)} if arguments.parity else {})})
+    history = load_history(history_path.read_text())
+    copy_database(template, finished)
+    subprocess.run([str(binary), library, arguments.vfs, 'finish', str(finished)], check=True, timeout=120)
+    # Validate undamaged copies without checkpointing or otherwise changing the templates.
+    for index, source in enumerate((template, finished)):
+        control = work/f'control-{index}'
+        control.mkdir()
+        copy_database(source, control/'db')
+        outcome, verdict = check(control/'db', history)
+        if verdict.kind != 'exact-recovery':
+            raise SystemExit(f'undamaged template failed: {verdict.kind}: {verdict.reason} {outcome[2]}')
+        shutil.rmtree(control)
+    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+        for number, faults, outcome, verdict, later in pool.map(lambda n: trial((template, finished), history, history_path, work, n), range(arguments.trials)):
+            stats['trials'] += 1
+            stats[verdict.kind] += 1
+            failed = later if later is not None and later.failed else verdict if verdict.failed else None
+            if failed is not None:
+                stats['failed'] += 1
+                failures.append((number, faults, failed.kind, failed.reason, outcome[0], outcome[1][-300:], outcome[2][-300:]))
+            follow_stats[later.kind if later is not None else 'not-attempted'] += 1
+            if later is not None:
+                for code in later.fields['codes']:
+                    codes[str(code)] += 1
+            fields = verdict.fields
+            if fields:
+                for code in fields['codes']:
+                    codes[str(code)] += 1
+                stats['rows observed'] += fields.get('rows', 0)
+                stats['wal cut'] += fields.get('cut', 0) != 0
+                stats['zero slots'] += fields.get('zero', 0) != 0
+                if fields.get('lost_commits') is not None:
+                    stats['acknowledged commits lost'] += fields['lost_commits']
+report = {'vfs': arguments.vfs, 'seed': arguments.seed, **stats, 'codes': dict(codes.most_common(8)), 'followthrough': dict(follow_stats)}
+print(json.dumps(report, indent=None if arguments.json else 1))
+for failure in failures[:12]: print('FAILED', failure)
+if stats['failed']: raise SystemExit(f"{stats['failed']} trials failed")
+if arguments.vfs == 'unix':
+    print('Native comparison completed; wrong-data and error outcomes are reported above.')
+else:
+    print('Soak passed: no incompatible history or incomplete observer results; exact recovery, prefix loss, and read/open errors are counted separately.')

@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Exercise native failures with a separate SQLite host and one-shot EIO hooks."""
+import os
+import pathlib
+import shlex
+import subprocess
+import sys
+import tempfile
+
+import mvbuild
+
+root = pathlib.Path(__file__).resolve().parent.parent
+host = root / 'target/sqlite'
+source = host / 'sqlite-amalgamation-3540000/sqlite3.c'
+if not source.exists():
+    subprocess.run([str(root / 'tools/build-host')], check=True)
+library = mvbuild.library()
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+obj = host / 'sqlite3-faults.o'
+if not obj.exists() or obj.stat().st_mtime < source.stat().st_mtime:
+    subprocess.run(cc + ['-O2', '-g', '-DSQLITE_THREADSAFE=1', '-DSQLITE_ENABLE_DBPAGE_VTAB',
+        '-Dfsync=mvfs_test_fsync', '-Dfdatasync=mvfs_test_fdatasync',
+        '-c', str(source), '-o', str(obj)], check=True)
+executable = mvbuild.host / 'faults'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O2', '-g', '-std=c11', '-I' + str(root / 'vendor/sqlite'),
+    str(root / 'tests/integration/faults.c'), str(obj)]
+    + libs + ['-o', str(executable)], check=True)
+temp_open = mvbuild.host / 'temp-open'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O2', '-g', '-std=c11', '-I' + str(root / 'vendor/sqlite'),
+    str(root / 'tests/integration/temp_open.c'), str(obj)]
+    + libs + ['-o', str(temp_open)], check=True)
+# Rust's guard uses libc directly, so its failures need OS symbol interposition
+# rather than SQLite's xSetSystemCall hooks. Keep this in a separate process.
+guard = mvbuild.host / ('guard-fault.' + mvbuild.SUFFIX)
+subprocess.run(cc + ['-O2', '-g', '-std=c11']
+    + (['-dynamiclib'] if sys.platform == 'darwin' else ['-shared', '-fPIC'])
+    + [str(root / 'tests/integration/guard-fault.c')] + libs + ['-o', str(guard)], check=True)
+pending = mvbuild.host / 'pending'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O2', '-g', '-std=c11', '-I' + str(root / 'vendor/sqlite'),
+    str(root / 'tests/integration/pending.c'), str(obj)]
+    + libs + ['-o', str(pending)], check=True)
+preload = 'DYLD_INSERT_LIBRARIES' if sys.platform == 'darwin' else 'LD_PRELOAD'
+environment = os.environ.copy()
+environment[preload] = str(guard) + (':' + environment[preload] if environment.get(preload) else '')
+with tempfile.TemporaryDirectory(prefix='monstervfs-faults-') as temporary:
+    for vfs in ('unix', mvbuild.VFS):
+        directory = pathlib.Path(temporary) / ('temp-open-' + vfs)
+        directory.mkdir()
+        subprocess.run([str(temp_open), library, str(directory), vfs], check=True, timeout=30)
+    subprocess.run([str(executable), library, temporary], check=True, timeout=60)
+    for mode in ('body', 'release', 'flush', 'rewrite-ok'):
+        command = [str(pending), library, str(pathlib.Path(temporary) / mode), mode]
+        subprocess.run(command + ['write'], check=True, timeout=30, env=environment)
+        subprocess.run(command + ['check'], check=True, timeout=30)

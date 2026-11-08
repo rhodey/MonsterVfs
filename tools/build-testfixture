@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Build SQLite's public Tcl testfixture with MonsterVfs as its default VFS."""
+import argparse, hashlib, os, pathlib, shlex, shutil, subprocess, sys, urllib.request, zipfile
+import mvbuild
+import mvtcl
+# Match Rust's default deployment target, including any caller override.
+if sys.platform == 'darwin':
+    rustc = shlex.split(os.environ.get('RUSTC', 'rustc'))
+    deployment = subprocess.check_output(rustc + ['--print', 'deployment-target'], text=True).strip()
+    key, value = deployment.split('=', 1)
+    if key != 'MACOSX_DEPLOYMENT_TARGET': raise SystemExit('unexpected Rust deployment target')
+    os.environ[key] = value
+root = pathlib.Path(__file__).resolve().parent.parent
+out = root/'target/testfixture'
+out.mkdir(parents=True, exist_ok=True)
+parser = argparse.ArgumentParser()
+parser.add_argument('--with-tcl', help='directory containing matching tclConfig.sh')
+parser.add_argument('--with-tclsh', help='Tcl 8.6+ executable for configure and code generation')
+args = parser.parse_args()
+tclsh = mvtcl.select_tclsh(args.with_tclsh)
+archive = out/'sqlite-src-3540000.zip'
+if not archive.exists():
+    temporary = archive.with_suffix('.zip.part')
+    with urllib.request.urlopen('https://www.sqlite.org/2026/sqlite-src-3540000.zip', timeout=30) as response, temporary.open('wb') as target:
+        shutil.copyfileobj(response, target)
+    temporary.replace(archive)
+if hashlib.sha256(archive.read_bytes()).hexdigest() != '8847659821e0c5116bd14a94644c82ba932b2d9a05ac81af2e34af814aad7c58':
+    raise SystemExit('SQLite source archive checksum differs')
+with zipfile.ZipFile(archive) as bundle:
+    for member in bundle.infolist():
+        if '..' in pathlib.PurePosixPath(member.filename).parts or member.filename.startswith('/'):
+            raise SystemExit('unsafe SQLite archive member')
+        path = pathlib.Path(bundle.extract(member, out))
+        if member.external_attr >> 16:
+            path.chmod((member.external_attr >> 16) & 0o777)
+source = out/'sqlite-src-3540000'
+build = out/mvbuild.NAME
+build.mkdir(exist_ok=True)
+mvtcl.configure(source, build, tclsh, args.with_tcl)
+arguments = mvbuild.cargo('static','lenient-pragmas')
+command = ['cargo','rustc','--release',*arguments,'--','--print','native-static-libs']
+result = subprocess.run(command,cwd=root,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
+if result.returncode: raise SystemExit(result.returncode)
+native = []
+for line in (result.stdout+result.stderr).splitlines():
+    if 'native-static-libs:' in line: native = shlex.split(line.split('native-static-libs:',1)[1])
+if not native: raise SystemExit('Rust did not report native static link libraries')
+cc = shlex.split(os.environ.get('CC','cc'))
+adapter = build/'monstervfs_test_init.o'
+subprocess.run(cc+mvbuild.CFLAGS+['-I'+str(root/'vendor/sqlite'),'-I'+str(root/'include'),'-c',
+               str(root/'tests/build/testfixture_init.c'),'-o',str(adapter)],check=True)
+if sys.platform == 'darwin': native = [flag for flag in native if flag != '-lSystem']
+link = [str(adapter),str(pathlib.Path(arguments[-1])/'release/libmonstervfs.a')]+native
+# Keep upstream flags, changing only the supported page size and startup adapter.
+makefile = build/'monstervfs.mk'
+makefile.write_text('include Makefile\n'
+    'override TESTFIXTURE_FLAGS := $(filter-out -DSQLITE_DEFAULT_PAGE_SIZE=1024,$(TESTFIXTURE_FLAGS)) -DSQLITE_DEFAULT_PAGE_SIZE=4096 -DSQLITE_EXTRA_INIT=monstervfs_test_init\n'
+    'override LDFLAGS.libsqlite3 += '+shlex.join(link)+'\n')
+subprocess.run(['make','-f',str(makefile),'testfixture'],cwd=build,check=True)
+print(f'Built {build / "testfixture"}; select tests using the applicability manifest.')

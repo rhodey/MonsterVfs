@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""SQLite's own stress tools, threadtest3 and mptest, on native and on MonsterVfs.
+
+Their sources are unchanged. The native VFS runs first as a control, so a test that
+fails there leaves the comparison inconclusive. Needs tools/build-testfixture for the sources."""
+import argparse, os, pathlib, shlex, subprocess, sys, tempfile
+import mvbuild
+from stress_verdict import assess, comparison, run
+root = pathlib.Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--library', help='extension to test; defaults to a debug build that absorbs rejected settings')
+parser.add_argument('--tests', default='walthread1,walthread2,walthread3,walthread4,walthread5,dynamic_triggers,'
+    'checkpoint_starvation_1,checkpoint_starvation_2,create_drop_index_1,lookaside1,vacuum1,stress1,stress2',
+    help='threadtest3 tests; shared1 and cgt_pager_1 need rollback journals or shared cache')
+parser.add_argument('--repeat', type=int, default=1, help='repeats of each mptest script')
+arguments = parser.parse_args()
+names = [name.strip() for name in arguments.tests.split(',')]
+if not all(names): parser.error('--tests must contain nonempty test names')
+if arguments.repeat < 1: parser.error('--repeat must be positive')
+host = root/'target/sqlite'
+source = root/'target/testfixture/sqlite-src-3540000'
+if not source.exists(): raise SystemExit('run tools/build-testfixture first')
+if not (host/'sqlite3.o').exists():
+    subprocess.run([str(root/'tools/build-host')], check=True)
+# These tools ask for settings the VFS rejects, so absorb those as the upstream runner does.
+library = mvbuild.library(arguments.library, extra=['lenient-pragmas'])
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+flags = ['-O1', '-g', '-w', '-I'+str(root/'vendor/sqlite'), '-I'+str(source/'test'), '-I'+str(source/'src'), '-I'+str(source/'mptest')]
+threads, multi = mvbuild.host/'upstream-threads', mvbuild.host/'upstream-multiprocess'
+subprocess.run(cc + mvbuild.CFLAGS + flags + [str(root/'tests/upstream/threads.c'), str(host/'sqlite3.o')] + libs + ['-o', str(threads)], check=True)
+subprocess.run(cc + mvbuild.CFLAGS + flags + [str(root/'tests/upstream/multiprocess.c'), str(host/'sqlite3.o')] + libs + ['-o', str(multi)], check=True)
+failed, inconclusive = [], []
+def report(kind, name, outcomes):
+    native = outcomes['unix'][0]
+    protected = outcomes[mvbuild.VFS][0]
+    status = comparison(native, protected)
+    print(f"{kind} {name}: {status}; native: {native.detail}; {mvbuild.VFS}: {protected.detail}", flush=True)
+    if status != 'passed':
+        (failed if status == 'failed' else inconclusive).append(f'{kind}:{name}')
+        for vfs, (verdict, output) in outcomes.items():
+            if not verdict.passed:
+                print(f'--- {vfs} output ---\n{output}', flush=True)
+
+for name in names:
+    outcomes = {}
+    for vfs in ('unix', mvbuild.VFS):
+        environment = {'MONSTERVFS_EXTENSION': None, 'MONSTERVFS_LENIENT': None} if vfs == 'unix' else {
+            'MONSTERVFS_EXTENSION': library, 'MONSTERVFS_LENIENT': '1'}
+        with tempfile.TemporaryDirectory(prefix='monstervfs-threads-') as directory:
+            code, output = run([str(threads), name], directory, environment, 300)
+        outcomes[vfs] = (assess('threadtest3', code, output), output)
+    report('threadtest3', name, outcomes)
+for script in ('multiwrite01.test', 'crash01.test', 'config02.test'):
+    outcomes = {}
+    for vfs in ('unix', mvbuild.VFS):
+        environment = {'MONSTERVFS_EXTENSION': None, 'MONSTERVFS_LENIENT': None} if vfs == 'unix' else {
+            'MONSTERVFS_EXTENSION': library, 'MONSTERVFS_LENIENT': '1'}
+        with tempfile.TemporaryDirectory(prefix='monstervfs-mptest-') as directory:
+            command = [str(multi), 'mp.db', str(source/'mptest'/script), '--vfs', vfs, '--journalmode', 'wal',
+                       '--repeat', str(arguments.repeat), '--quiet']
+            code, output = run(command, directory, environment, 600)
+        outcomes[vfs] = (assess('mptest', code, output), output)
+    report('mptest', script, outcomes)
+print(f'Upstream stress: {len(failed)} failed comparisons, {len(inconclusive)} inconclusive controls.', flush=True)
+if failed:
+    print('Failed: ' + ', '.join(failed), file=sys.stderr)
+if inconclusive:
+    print('Inconclusive: ' + ', '.join(inconclusive), file=sys.stderr)
+if failed or inconclusive:
+    raise SystemExit(1 if failed else 2)
+print('Upstream stress passed: every requested workload and its native control completed cleanly.')

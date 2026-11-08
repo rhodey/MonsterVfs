@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Multi-process kill -9 stress through real SQLite, with live and dead-process WAL damage."""
+import argparse, os, pathlib, shlex, subprocess, sys, tempfile
+import mvbuild
+root = pathlib.Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--seconds', type=float, default=15, help='running time per seed')
+parser.add_argument('--seeds', type=int, default=1)
+parser.add_argument('--first-seed', type=int, default=1)
+parser.add_argument('--directory', help='keep files here instead of a temporary directory')
+parser.add_argument('--kind', type=int, choices=range(4), help='only 0 clean, 1 repair, 2 dead-process or 3 live-process damage')
+parser.add_argument('--synced', action='store_true', help='use real syncs: fewer but differently timed commits')
+arguments = parser.parse_args()
+host = root/'target/sqlite'
+if not (host/'sqlite3.o').exists():
+    subprocess.run([str(root/'tools/build-host')], check=True)
+library = mvbuild.library()
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+# Killing a process loses nothing the kernel holds, so syncs only limit how many
+# interleavings a run reaches. tools/test-crash is what tests sync placement.
+engine = host/'sqlite3.o'
+if not arguments.synced:
+    engine = host/'sqlite3-nosync.o'
+    if not engine.exists() or engine.stat().st_mtime < (host/'sqlite3.o').stat().st_mtime:
+        subprocess.run(cc + ['-O1', '-g', '-DSQLITE_NO_SYNC', '-DSQLITE_THREADSAFE=1', '-DSQLITE_ENABLE_DBPAGE_VTAB',
+            '-c', str(host/'sqlite-amalgamation-3540000/sqlite3.c'), '-o', str(engine)], check=True)
+binary = mvbuild.host/'stress'
+subprocess.run(cc + mvbuild.CFLAGS + ['-O1', '-g', '-I'+str(root/'vendor/sqlite'), '-I'+str(root/'include'),
+    str(root/'tests/integration/stress.c'), str(engine)] + libs + ['-o', str(binary)], check=True)
+limit = arguments.seconds + 120
+kind = [] if arguments.kind is None else [str(arguments.kind)]
+def stress(place, seconds, seed, kinds, environment):
+    place.mkdir()
+    subprocess.run([str(binary), library, str(place), str(seconds), str(seed)] + kinds,
+                   check=True, timeout=limit, env={**os.environ, **environment})
+def run(directory):
+    # The native VFS has no slots to damage. A failure here is a harness bug.
+    print('native control:', flush=True)
+    stress(pathlib.Path(directory)/'control', min(5, arguments.seconds), arguments.first_seed, ['3'], {'STRESS_VFS': 'unix'})
+    for seed in range(arguments.first_seed, arguments.first_seed + arguments.seeds):
+        print(f'seed {seed}:', flush=True)
+        stress(pathlib.Path(directory)/f'seed-{seed}', arguments.seconds, seed, kind, {})
+if arguments.directory:
+    run(arguments.directory)
+else:
+    with tempfile.TemporaryDirectory(prefix='monstervfs-stress-') as temporary:
+        run(temporary)
+print('Stress passed: kills, correctable damage and destroyed slots, with no lost, mixed or stuck state.')

@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""Check automatic maintenance quiescence using ordinary host SQLite lifetimes."""
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+
+import mvbuild
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--both", action="store_true", help="exercise both codecs in the same SQLite host")
+args = parser.parse_args()
+root = mvbuild.root
+if not (root / 'target/sqlite/sqlite3.o').exists():
+    subprocess.run([str(root / 'tools/build-host')], check=True)
+library = mvbuild.library()
+other = mvbuild.library(build="copy" if mvbuild.NAME == "parity" else "parity") if args.both else None
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+executable = mvbuild.host / 'lifecycle'
+subprocess.run(cc + mvbuild.CFLAGS + ['-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', '-g',
+    '-I' + str(root / 'vendor/sqlite'), str(root / 'tests/integration/lifecycle.c'),
+    str(root / 'target/sqlite/sqlite3.o')] + libs + ['-o', str(executable)], check=True)
+with tempfile.TemporaryDirectory(prefix='monstervfs-lifecycle-') as directory:
+    subprocess.run([str(executable), library, directory] + ([other] if other else []), check=True, timeout=90)

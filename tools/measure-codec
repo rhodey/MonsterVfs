@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Measure Reed-Solomon encode and correction cost per WAL slot, for each parity size."""
+import os, pathlib, shlex, subprocess
+root = pathlib.Path(__file__).resolve().parent.parent
+out = root/'target/build-tests'
+out.mkdir(parents=True, exist_ok=True)
+vendor = root/'vendor/libfec'
+cc = shlex.split(os.environ.get('CC', 'cc'))
+subprocess.run(cc + ['-O3', '-std=c99', '-Wno-sign-compare', '-I'+str(vendor), str(root/'tests/integration/codec_bench.c'),
+    str(vendor/'init_rs_int.c'), str(vendor/'encode_rs_int.c'), str(vendor/'decode_rs_int.c'),
+    '-o', str(out/'codec-bench')], check=True)
+subprocess.run([str(out/'codec-bench')], check=True)

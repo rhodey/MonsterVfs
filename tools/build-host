@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Build a pinned, independent SQLite host; optionally link the static VFS."""
+import argparse, hashlib, os, pathlib, shlex, shutil, subprocess, sys, urllib.request, zipfile
+import mvbuild
+# Match Rust's default deployment target, including any caller override.
+if sys.platform == 'darwin':
+    rustc = shlex.split(os.environ.get('RUSTC', 'rustc'))
+    deployment = subprocess.check_output(rustc + ['--print', 'deployment-target'], text=True).strip()
+    key, value = deployment.split('=', 1)
+    if key != 'MACOSX_DEPLOYMENT_TARGET': raise SystemExit('unexpected Rust deployment target')
+    os.environ[key] = value
+root = pathlib.Path(__file__).resolve().parent.parent
+out = root / 'target/sqlite'
+out.mkdir(parents=True, exist_ok=True)
+parser = argparse.ArgumentParser()
+parser.add_argument('--static', action='store_true', help='also build the host-linked VFS test')
+args = parser.parse_args()
+version = '3540000'
+archive_hash = '68e913b0fe8ec6b4e5f391c594a28872884e80d6cd042a1e50c957be46b5aa4d'
+archive = out / f'sqlite-amalgamation-{version}.zip'
+if not archive.exists():
+    temporary = archive.with_suffix('.zip.part')
+    url = f'https://www.sqlite.org/2026/sqlite-amalgamation-{version}.zip'
+    with urllib.request.urlopen(url, timeout=30) as response, temporary.open('wb') as target:
+        shutil.copyfileobj(response, target)
+    temporary.replace(archive)
+if hashlib.sha256(archive.read_bytes()).hexdigest() != archive_hash:
+    raise SystemExit('SQLite archive checksum differs')
+source = out / f'sqlite-amalgamation-{version}'
+with zipfile.ZipFile(archive) as bundle:
+    for member in bundle.infolist():
+        if '..' in pathlib.PurePosixPath(member.filename).parts or member.filename.startswith('/'):
+            raise SystemExit('unsafe SQLite archive member')
+    bundle.extractall(out)
+cc = shlex.split(os.environ.get('CC', 'cc'))
+flags = ['-O2', '-g', '-DSQLITE_THREADSAFE=1', '-DSQLITE_ENABLE_DBPAGE_VTAB',
+         '-DSQLITE_ENABLE_DBSTAT_VTAB', '-DSQLITE_ENABLE_FTS5', '-DSQLITE_ENABLE_RTREE',
+         '-I'+str(source), '-I'+str(root/'include')]
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+obj = out/'sqlite3.o'
+subprocess.run(cc + flags + ['-c', str(source/'sqlite3.c'), '-o', str(obj)], check=True)
+subprocess.run(cc + flags + [str(source/'shell.c'), str(obj)] + libs + ['-o', str(out/'sqlite3')], check=True)
+subprocess.run(cc + flags + mvbuild.CFLAGS + [str(root/'tests/build/abi_smoke.c'), str(obj)] + libs + ['-o', str(mvbuild.host/'abi-loadable')], check=True)
+if args.static:
+    arguments = mvbuild.cargo('static')
+    command = ['cargo', 'rustc', '--release', *arguments, '--', '--print', 'native-static-libs']
+    result = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
+    if result.returncode: raise SystemExit(result.returncode)
+    native = []
+    for line in (result.stdout + result.stderr).splitlines():
+        if 'native-static-libs:' in line:
+            native = shlex.split(line.split('native-static-libs:', 1)[1])
+    if not native: raise SystemExit('Rust did not report native static link libraries')
+    if sys.platform == 'darwin': native = [flag for flag in native if flag != '-lSystem']
+    extra_libs = [flag for flag in libs if flag not in native]
+    library = pathlib.Path(arguments[-1])/'release/libmonstervfs.a'
+    subprocess.run(cc + flags + mvbuild.CFLAGS + ['-DMVFS_STATIC_HOST', str(root/'tests/build/abi_smoke.c'),
+                   str(obj), str(library)] + native + extra_libs + ['-o', str(mvbuild.host/'abi-static')], check=True)
+print(f'Built independent SQLite host and ABI tests in {out}')

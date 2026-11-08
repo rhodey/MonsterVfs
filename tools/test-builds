@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Both builds at once: each works, and each refuses the other's files without changing them."""
+import os, pathlib, shlex, subprocess, sys, tempfile
+import mvbuild
+root = mvbuild.root
+host = root/'target/sqlite'
+if not (host/'sqlite3.o').exists():
+    subprocess.run([str(root/'tools/build-host')], check=True)
+libraries = [mvbuild.library(build=build) for build in ('parity', 'copy')]
+cc = shlex.split(os.environ.get('CC', 'cc'))
+libs = ['-lpthread', '-lm'] + ([] if sys.platform == 'darwin' else ['-ldl'])
+binary = host/'builds'
+subprocess.run(cc + ['-O1', '-g', '-I'+str(root/'vendor/sqlite'), str(root/'tests/integration/builds.c'),
+    str(host/'sqlite3.o')] + libs + ['-o', str(binary)], check=True)
+with tempfile.TemporaryDirectory(prefix='monstervfs-builds-') as directory:
+    subprocess.run([str(binary), *libraries, directory], check=True, timeout=60)

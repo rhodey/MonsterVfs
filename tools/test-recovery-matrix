@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Named logical damage targets; comparison results are not field failure rates.
+
+The native/parity/copy workload and intended SQL bytes match. Payload targets
+are located within the requested row and transaction, not at equal file offsets.
+Redundancy-exhausting cases damage every copy and explicitly report that larger
+physical exposure. Protected-only metadata faults have no native equivalent.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+
+from soak_verdict import load_history, evaluate
+from soak_followthrough import run as followthrough
+
+PAGE, SLOT, RESERVED = 4096, 8192, 48
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def regions(raw, codec, wal):
+    """Expose pristine payload offsets solely to select physical damage locations."""
+    if codec == 'native':
+        start, width = (32, PAGE + 24) if wal else (0, PAGE)
+    else:
+        start, width = (16384 if wal else 8192), SLOT
+    require(len(raw) >= start and (len(raw) - start) % width == 0, 'unexpected pristine file geometry')
+    for index, begin in enumerate(range(start, len(raw), width), 1):
+        if codec == 'native':
+            header, pages = (begin, [begin + 24]) if wal else (None, [begin])
+        elif codec == 'parity':
+            header, pages = (begin + PAGE - 24 if wal else None), [begin + PAGE]
+        else:
+            header, pages = (begin + PAGE - 28 if wal else None), [begin, begin + PAGE]
+        page_number = struct.unpack_from('>I', raw, header)[0] if wal else index
+        commit = struct.unpack_from('>I', raw, header + 4)[0] if wal else 0
+        yield dict(index=index, page=page_number, commit=commit, header=header, pages=pages)
+
+
+def locate(raw, codec, wal, value, transaction=None):
+    matches = []
+    current = 1
+    for region in regions(raw, codec, wal):
+        if not wal or current == transaction:
+            length = PAGE if codec == 'native' else PAGE - RESERVED
+            page = raw[region['pages'][0]:region['pages'][0] + length]
+            offset = page.find(value)
+            if offset >= 0:
+                require(page.find(value, offset + 1) < 0, 'duplicate row bytes within a page')
+                for copy in region['pages']:
+                    require(raw[copy + offset:copy + offset + len(value)] == value, 'pristine copies differ')
+                matches.append({**region, 'transaction': transaction, 'row_offset': offset,
+                                'positions': [copy + offset + 40 for copy in region['pages']]})
+        if wal and region['commit']:
+            current += 1
+    require(len(matches) == 1, f'row target is not unique: {len(matches)} matches')
+    return matches[0]
+
+
+def newest_control(raw, codec):
+    require(codec != 'native', 'native SQLite has no persisted VFS control')
+    candidates = []
+    for offset in (8192, 12288):
+        payload = raw[offset:offset + 128]
+        sequence = int.from_bytes(payload[8:16], 'little')
+        recorded = int.from_bytes(payload[56:60], 'little')
+        watermark = recorded if payload[48:56] == payload[32:40] else 0
+        if codec == 'copy':
+            require(payload == raw[offset + 2048:offset + 2176], 'pristine control copies differ')
+        candidates.append(dict(offset=offset, sequence=sequence, watermark=watermark,
+                               recorded_watermark=recorded, salts=payload[48:56].hex(),
+                               wal_salts=payload[32:40].hex()))
+    candidates.sort(key=lambda item: item['sequence'])
+    return candidates[-1], candidates[0]
+
+
+def damage(path, positions, length, xor=1):
+    events = []
+    with path.open('r+b') as file:
+        for offset in positions:
+            file.seek(offset)
+            old = file.read(length)
+            require(len(old) == length, 'damage extends beyond its target')
+            file.seek(offset)
+            file.write(bytes(value ^ xor for value in old))
+            events.append(dict(offset=offset, length=length, xor=xor))
+    return events
+
+
+def copy_database(source, target):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    wal = Path(str(source) + '-wal')
+    if wal.exists():
+        shutil.copyfile(wal, str(target) + '-wal')
+    # Never copy SHM: each isolated observer must rebuild recovery state.
+
+
+def compile_host(codec, output):
+    obj = ROOT / 'target/sqlite/sqlite3.o'
+    if not obj.exists():
+        subprocess.run([str(ROOT / 'tools/build-host')], check=True)
+    binary = output / f'soak-{codec}'
+    flags = [f'-DMVFS_NAME="monstervfs_{codec}"', '-DMVFS_ENTRY="sqlite3_extension_init"',
+             f'-DMVFS_COPY={int(codec == "copy")}']
+    command = shlex.split(os.environ.get('CC', 'cc')) + flags + ['-O1', '-g', '-I' + str(ROOT / 'vendor/sqlite'),
+               str(ROOT / 'tests/integration/soak.c'), str(obj), '-lpthread', '-lm']
+    if sys.platform != 'darwin':
+        command += ['-ldl']
+    command += ['-o', str(binary)]
+    subprocess.run(command, check=True)
+    build = dict(command=command, sqlite_object=dict(path=str(obj), sha256=hashlib.sha256(obj.read_bytes()).hexdigest()),
+                 binary=dict(path=str(binary), sha256=hashlib.sha256(binary.read_bytes()).hexdigest()))
+    return binary, build
+
+
+def codec_cases(codec, binary, library, output):
+    work = output / codec
+    work.mkdir()
+    commands = []
+
+    def invoke(*args):
+        command = [str(binary), str(library), 'unix' if codec == 'native' else 'monstervfs_' + codec,
+                   *map(str, args)]
+        commands.append(command)
+        (work / 'commands.json').write_text(json.dumps(commands, indent=2) + '\n')
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=120)
+            return result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired as error:
+            def decoded(value):
+                return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value or ''
+            return None, decoded(error.stdout), decoded(error.stderr)
+
+    template = work / 'template' / 'db'
+    template.parent.mkdir()
+    preparation = invoke('prepare', template)
+    require(preparation[0] == 0, f'{codec} prepare failed: {preparation[2]}')
+    history = load_history(preparation[1])
+    (work / 'history.jsonl').write_text(preparation[1])
+    finished = work / 'finished' / 'db'
+    copy_database(template, finished)
+    outcome = invoke('finish', finished)
+    require(outcome[0] == 0, f'{codec} finish failed: {outcome[2]}')
+    raw_wal = Path(str(template) + '-wal').read_bytes()
+    raw_main = finished.read_bytes()
+    targets = {'main': locate(raw_main, codec, False, history.snapshots[60][149])}
+    for commit in (10, 60):
+        row = (commit * 37) % history.rows + 1
+        targets[str(commit)] = {**locate(raw_wal, codec, True, history.snapshots[commit][row - 1], commit), 'row': row}
+    if codec != 'native':
+        newest, older = newest_control(raw_wal, codec)
+        require(targets['10']['index'] <= newest['watermark'] < targets['60']['index'],
+                'selected frames do not straddle checkpoint watermark')
+        targets['controls'] = [older, newest]
+    (work / 'targets.json').write_text(json.dumps(targets, indent=2) + '\n')
+    names = ['clean-main', 'clean-wal', 'main-bit', 'main-payload-loss', 'wal-tail-bit',
+             'wal-tail-payload-loss', 'wal-backfilled-payload-loss']
+    if codec != 'native':
+        names += ['control-region-loss', 'control-and-backfilled-payload-loss']
+    reports = []
+    for name in names:
+        case = work / name
+        database = case / 'db'
+        copy_database(finished if name.startswith('main-') or name == 'clean-main' else template, database)
+        fault = []
+        target = None
+        wal = Path(str(database) + '-wal')
+        if name.startswith('main-'):
+            target = targets['main']
+            fault += damage(database, target['positions'][:1] if name.endswith('-bit') else target['positions'],
+                            1 if name.endswith('-bit') else 32)
+        elif name.startswith('wal-') or name == 'control-and-backfilled-payload-loss':
+            target = targets['60' if name.startswith('wal-tail') else '10']
+            fault += damage(wal, target['positions'][:1] if name.endswith('-bit') else target['positions'],
+                            1 if name.endswith('-bit') else 32)
+        if name.startswith('control-'):
+            # Entire newest region lost, including both halves for copy; older
+            # checkpoint evidence remains valid. This fault has no native analogue.
+            offset = targets['controls'][-1]['offset']
+            with wal.open('r+b') as file:
+                file.seek(offset); file.write(bytes(4096))
+            fault.append(dict(offset=offset, length=4096, fill=0, kind='newest-control'))
+        before = case / 'input' / 'db'
+        copy_database(database, before)
+        outcome = invoke('check', database)
+        verdict = evaluate(*outcome, history=history, native=codec == 'native')
+        later, evidence = None, None
+        if verdict.kind in ('exact-recovery', 'prefix-loss'):
+            later, evidence = followthrough(invoke, database, history, verdict.fields['commit'], native=codec == 'native')
+        record = dict(codec=codec, case=name, target=target, faults=fault,
+                      outcome=dict(zip(('code', 'stdout', 'stderr'), outcome)),
+                      verdict=dataclasses.asdict(verdict),
+                      followthrough=dataclasses.asdict(later) if later else None, followthrough_evidence=evidence)
+        (case / 'result.json').write_text(json.dumps(record, indent=2) + '\n')
+        reports.append({key: record[key] for key in ('codec', 'case', 'verdict', 'followthrough', 'faults', 'target')})
+        print(f"{codec:6} {name:36} {verdict.kind:15} {later.kind if later else '-'}", flush=True)
+    (work / 'commands.json').write_text(json.dumps(commands, indent=2) + '\n')
+    return reports
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--parity-library', required=True, type=Path)
+    parser.add_argument('--copy-library', required=True, type=Path)
+    parser.add_argument('--output', required=True, type=Path, help='new directory preserving every input and observation')
+    args = parser.parse_args()
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    libraries = {'parity': args.parity_library.resolve(), 'copy': args.copy_library.resolve()}
+    files = ['tools/test-recovery-matrix', 'tools/soak_verdict.py', 'tools/soak_followthrough.py',
+             'tests/integration/soak.c', 'tests/tools/test_recovery_matrix.py']
+    manifest = dict(revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+                    sources={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in files},
+                    libraries={name: dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest()) for name, path in libraries.items()},
+                    invocation=sys.argv,
+                    host=dict(zip(('system', 'node', 'release', 'version', 'machine'), os.uname())), builds=[])
+    (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    reports = []
+    try:
+        for build in ('parity', 'copy'):
+            binary, artifact = compile_host(build, output)
+            manifest['builds'].append(artifact)
+            (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+            for codec in (('native', 'parity') if build == 'parity' else ('copy',)):
+                reports += codec_cases(codec, binary, libraries[build], output)
+        histories = [(output / codec / 'history.jsonl').read_bytes() for codec in ('native', 'parity', 'copy')]
+        require(histories[0] == histories[1] == histories[2], 'prepared transaction histories differ across formats')
+        (output / 'results.json').write_text(json.dumps(reports, indent=2) + '\n')
+        # Keep the accepted double-fault observation visible; it is not verified
+        # recovery and must never be included in a passing-recovery count.
+        bad = [r for r in reports if (r['verdict']['failed'] and
+               not (r['case'] == 'control-and-backfilled-payload-loss' and r['verdict']['kind'] == 'wrong-data'))
+               or (r['followthrough'] and r['followthrough']['failed'])]
+        healthy = [r for r in reports if r['case'].startswith('clean-') or
+                   (r['codec'] != 'native' and r['case'] in ('main-bit', 'wal-tail-bit', 'control-region-loss'))]
+        bad += [r for r in healthy if r['verdict']['kind'] != 'exact-recovery' or
+                not r['followthrough'] or r['followthrough']['kind'] != 'usable']
+        require(not bad, f'{len(bad)} unexpected matrix outcomes; inspect preserved results')
+        wrong = [dict(codec=r['codec'], case=r['case']) for r in reports if r['verdict']['kind'] == 'wrong-data']
+        (output / 'complete.json').write_text(json.dumps({'exit_code': 0, 'cases': len(reports),
+            'wrong_data_observations': wrong, 'meaning': 'comparison completed; wrong-data cases are not verified recoveries'}, indent=2) + '\n')
+    except BaseException as error:
+        (output / 'complete.json').write_text(json.dumps({'exit_code': 1, 'error': str(error)}) + '\n')
+        raise
+
+
+if __name__ == '__main__':
+    main()
